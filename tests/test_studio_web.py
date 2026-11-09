@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from starlette.requests import Request
 
+from core.workflow import edition_path, write_json
 from studio_web import create_studio_app
+from tests.test_daily import scratch_dir
 
 
 def _call_app(app, method: str, path: str, *, query: str = "", body: dict | None = None, headers: list[tuple[bytes, bytes]] | None = None):
@@ -34,9 +36,31 @@ def _call_app(app, method: str, path: str, *, query: str = "", body: dict | None
 
 
 class StudioWebTest(unittest.TestCase):
+    def test_release_returns_the_exact_approved_video_path_for_submission(self):
+        day = "2026-11-08"
+        with (scratch_dir() as output,
+              patch("studio_web.account_hint", return_value=("个人测试账号", "personal")),
+              patch("core.news_release.submit_douyin", return_value="demo-item")):
+            video = output / "daily" / "clip.mp4"
+            video.parent.mkdir()
+            video.write_bytes(b"test video")
+            saved_path = str(video.parent / ".." / "daily" / video.name)
+            edition = edition_path(output, day)
+            edition.parent.mkdir()
+            write_json(edition, {"items": {"douyin": {"package": {"video": saved_path}}}})
+            app = create_studio_app(output)
+            state = json.loads(_call_app(app, "GET", "/api/state", query=f"day={day}").body)
+            release = state["edition"]["items"]["douyin"]["release"]
+            result = _call_app(app, "POST", "/api/action", body={
+                "action": "publish", "day": day, "platform": "douyin",
+                "payload": {"video": release["video"], "account": release["identity"]},
+            })
+            self.assertEqual(result.status_code, 200, result.body.decode())
+            self.assertEqual(json.loads(result.body)["result"], "demo-item")
+
     def test_workbench_html_has_all_five_views_and_zero_cringe_or_emojis(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            app = create_studio_app(Path(tmp))
+        with scratch_dir() as output:
+            app = create_studio_app(output)
             resp = _call_app(app, "GET", "/")
             self.assertEqual(resp.status_code, 200)
             html = resp.body.decode("utf-8")
@@ -53,8 +77,7 @@ class StudioWebTest(unittest.TestCase):
                 self.assertNotIn(forbidden, html)
 
     def test_api_state_and_story_selection_and_cut_editing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp)
+        with scratch_dir() as out:
             app = create_studio_app(out)
 
             # 1. Select a story from intake into xiaohongshu
@@ -129,14 +152,13 @@ class StudioWebTest(unittest.TestCase):
             self.assertTrue(any(c["title"] == "电子产品选购参数核对结构" for c in cw))
 
     def test_media_endpoint_blocks_outside_files_and_supports_byte_ranges(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp)
+        with scratch_dir() as out:
             sample = out / "video_test.mp4"
             sample.write_bytes(b"0123456789abcdefghijklmnopqrstuvwxyz")
             app = create_studio_app(out)
 
             # Reject file outside allowed roots
-            outside = Path(tmp).parent / "outside_secret.txt"
+            outside = out.parent / "outside_secret.txt"
             resp_bad = _call_app(app, "GET", "/api/media", query=f"path={outside}")
             self.assertEqual(resp_bad.status_code, 404)
 

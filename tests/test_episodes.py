@@ -9,6 +9,13 @@ from test_daily import scratch_dir
 
 
 class EpisodeTests(unittest.TestCase):
+    def test_chinese_magnitude_and_approximate_age_match_the_same_evidence(self):
+        from core.episodes import _numbers
+
+        self.assertEqual(_numbers("距今五亿多年的岩层"), {"500000000"})
+        self.assertEqual(_numbers("距今 5 亿余年的岩层"), {"500000000"})
+        self.assertEqual(_numbers("设备额定 1.2 万米"), {"12000"})
+
     def test_manual_selection_keeps_exact_topics_and_archives_previous_work(self):
         from core.workflow import edition_path, read_edition, run_stage, write_json
 

@@ -55,6 +55,7 @@ class Desk:
     def __init__(self, root):
         self.root = root
         self.jobs = queue.Queue()
+        self.readers = []
         self.edition = {}
         self.busy = False
         self.active = set()
@@ -151,9 +152,9 @@ class Desk:
         self.update_intake(read_intake(OUTPUT_DIR))
         self.show_department("overview")
         root.bind("<Escape>", lambda event: self.show_department("overview"))
-        self.root.after(120, self.poll)
-        self.check_schedule()
         if "--check" not in sys.argv:
+            self.root.after(120, self.poll)
+            self.check_schedule()
             self.root.after(700, self.auto_collection)
             self.root.after_idle(self.start_local_ai)
 
@@ -350,6 +351,11 @@ class Desk:
                     item = read_edition(edition_path(OUTPUT_DIR, self.date.get()))["items"].get(platform, {})
                 except (OSError, ValueError):
                     item = {}
+                current = self.edition["items"].get(platform, {})
+                if (item.get("id") == current.get("id") and item.get("preview")
+                        and item.get("preview_revision") != current.get("preview_revision")):
+                    self.edition["items"][platform] = item
+                    self.show_story()
                 if progress := item.get("editorial_progress"):
                     self.status.configure(text=progress)
         self.root.after(120, self.poll)
@@ -639,6 +645,9 @@ class Desk:
         if draft:
             ttk.Button(tools, text="审看编辑分镜", state=state, command=lambda: self.edit_cut(platform, draft)).pack(
                 side="left", padx=6)
+            length = sum(len(shot["text"]) for shot in draft["scenes"])
+            ttk.Label(self.detail, text=f"口播约 {length:,} 字 · 导出前按实际配音校验时长",
+                      style="Muted.TLabel").pack(anchor="w", pady=(2, 4))
             if direction := draft.get("editorial_plan", {}).get("throughline"):
                 ttk.Label(self.detail, text=direction, wraplength=wrap, style="Muted.TLabel").pack(anchor="w", pady=(2, 4))
             for index, marker in enumerate(draft.get("chapter_starts", []), 1):
@@ -793,10 +802,18 @@ class Desk:
                  "duration": package.get("duration"), "reading_pages": package.get("reading_pages", []),
                  "chapter": chapter, "autoplay": autoplay}
         try:
-            subprocess.Popen([*desktop_command(), "--reader", json.dumps(issue, ensure_ascii=False)],
-                             env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}, creationflags=NO_WINDOW)
+            self.readers = [reader for reader in self.readers if reader.poll() is None]
+            self.readers.append(subprocess.Popen(
+                [*desktop_command(), "--reader", json.dumps(issue, ensure_ascii=False)], creationflags=NO_WINDOW,
+            ))
         except OSError as error:
             messagebox.showerror("阅读器未打开", str(error), parent=self.root)
+
+    def close_readers(self):
+        for reader in self.readers:
+            if reader.poll() is None:
+                reader.terminate()
+                reader.wait(timeout=2)
 
     def open_copywriting(self):
         self.show_department("copywriting")
@@ -909,27 +926,55 @@ def main():
     root = tk.Tk()
     desk = Desk(root)
     if "--check" in sys.argv:
-        root.update()
-        for name, view in desk.sections.items():
-            desk.show_department(name)
-            root.update()
-            if not view.winfo_viewable():
-                raise RuntimeError(f"桌面页面未显示：{name}")
-        desk.show_department("overview")
-        root.update()
-        graph = desk.dashboard.graph
-        graph.motion = False
-        yaw = graph.yaw
-        graph.turn(.18)
-        if not graph.find_all() or graph.yaw == yaw:
-            raise RuntimeError("运营图表未绘制或无法改变视角。")
+        pages = iter((*desk.sections, "overview"))
+        errors = []
+
+        def navigate(current=None, deadline=None):
+            try:
+                if current and not desk.sections[current].winfo_viewable():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f"桌面页面未显示：{current}")
+                    root.after(75, lambda: navigate(current, deadline))
+                    return
+                if next_page := next(pages, None):
+                    desk.show_department(next_page)
+                    root.after_idle(lambda: root.after(75, lambda: navigate(next_page, time.monotonic()+12)))
+                    return
+                graph = desk.dashboard.graph
+                graph.motion = False
+                yaw = graph.yaw
+                graph.turn(.18)
+                if not graph.find_all() or graph.yaw == yaw:
+                    raise RuntimeError("运营图表未绘制或无法改变视角。")
+            except Exception as error:
+                errors.append(error)
+            root.quit()
+
+        root.after_idle(navigate)
+        root.mainloop()
+        if errors:
+            root.destroy()
+            raise errors[0]
         subprocess.run([get_ffmpeg(), "-version"], check=True, capture_output=True, creationflags=NO_WINDOW)
         (DATA_DIR / "desktop-check.txt").write_text(
             f"Tk UI, {len(desk.sections)} views, 3D chart and bundled FFmpeg OK\n", encoding="utf-8",
         )
-        root.destroy()
+        if len(sys.argv) == 3 and sys.argv[1] == "--check":
+            issue = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+            root.title("热采放映室 · 工作台自检")
+            desk.read_work(issue, "联动阅读器自检", issue["platform"], issue.get("cover"))
+            (DATA_DIR / "reader-launch.txt").write_text(str(time.time()), encoding="utf-8")
+            try:
+                root.mainloop()
+            finally:
+                desk.close_readers()
+        else:
+            root.destroy()
         return 0
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        desk.close_readers()
     return 0
 
 

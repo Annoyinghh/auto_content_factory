@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
@@ -155,7 +156,7 @@ def build_release_info(edition: dict[str, Any], day: str, output_dir: Path, plat
     video_file = resolve_media_path(video_raw, output_dir)
     cover_file = resolve_media_path(cover_raw, output_dir)
 
-    account_label, identity = account_hint(platform) if platform in PUBLISHERS else ("创作者后台直传", None)
+    account_label, identity = account_hint(platform) if platform in PUBLISHERS else ("创作者后台", None)
     directory = release_directory(edition_path(output_dir, day), platform, item)
     receipt = (directory / "submitted.txt").is_file()
     receipt_id = (directory / "submitted.txt").read_text(encoding="utf-8").strip() if receipt else ""
@@ -179,7 +180,7 @@ def build_release_info(edition: dict[str, Any], day: str, output_dir: Path, plat
         state = "已暂缓"
         code = "held"
     elif platform not in PUBLISHERS:
-        state = "创作者后台插件待命"
+        state = "暂无直连接口"
         code = "browser_ready"
     elif not identity:
         state = "需要开放平台授权"
@@ -194,7 +195,7 @@ def build_release_info(edition: dict[str, Any], day: str, output_dir: Path, plat
         "title": package.get("title") or item.get("story", {}).get("title") or "未排期选题",
         "account": account_label,
         "identity": identity,
-        "video": str(video_file) if video_file else video_raw,
+        "video": video_raw,
         "video_url": media_url(video_raw, output_dir),
         "cover": str(cover_file) if cover_file else cover_raw,
         "cover_url": media_url(cover_raw, output_dir),
@@ -340,9 +341,9 @@ def build_accounts_payload() -> dict[str, Any]:
         accounts[platform] = {
             "platform": platform,
             "platform_name": name,
-            "label": "官方创作者后台 + 浏览器插件装填",
+            "label": "请在创作者后台管理",
             "identity": None,
-            "authorized": True,
+            "authorized": False,
             "client": "",
             "redirect": "",
             "partition": "",
@@ -610,11 +611,12 @@ def create_studio_app(output_dir: Path | None = None) -> Starlette:
 
             if action == "publish":
                 state.record_job("publish", platform, "running", "正在提交开放平台审核")
-                result = run_stage("publish", day, state.output_dir, platform=platform, payload=payload if payload else None)
+                result = await run_in_threadpool(run_stage, "publish", day, state.output_dir,
+                                                 platform=platform, payload=payload)
                 state.record_job("publish", platform, "completed", "已提交开放平台审核")
                 return JSONResponse({
                     "ok": True,
-                    "message": "已提交平台审核。",
+                    "message": f"已提交平台审核 · 稿件编号 {result}",
                     "result": result,
                     "edition": enrich_edition(day, state.output_dir),
                     "jobs": list(state.jobs),
@@ -758,10 +760,13 @@ def create_studio_app(output_dir: Path | None = None) -> Starlette:
 
         except Exception as error:
             state.record_job(action or "error", platform, "failed", str(error))
-            return JSONResponse(
-                {"ok": False, "error": str(error) or type(error).__name__, "jobs": list(state.jobs)},
-                status_code=400,
-            )
+            failure = {"ok": False, "error": str(error) or type(error).__name__, "jobs": list(state.jobs)}
+            if action == "publish":
+                try:
+                    failure["edition"] = enrich_edition(day, state.output_dir)
+                except (ValueError, OSError):
+                    pass
+            return JSONResponse(failure, status_code=400)
 
     async def storm_bg(request: Request) -> Response:
         bg_path = ASSETS_DIR / "storm-background.jpg"

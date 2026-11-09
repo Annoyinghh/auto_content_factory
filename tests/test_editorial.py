@@ -60,7 +60,7 @@ class EditorialTests(unittest.TestCase):
         evidence = {"1": {"source_id": "report", "quote": quote}}
         valid = {"title": "实测深度", "text": "井深的实测值是10910米。", "media": "", "motion": "push",
                  "evidence_ids": ["1"]}
-        invalid = {**valid, "title": "测量结果", "text": "报告记录的深度是3000米。"}
+        invalid = {**valid, "title": "测量结果", "text": "报告记录的深度是3000米，除了"}
         corrected = "报告中所说的是钻完时的实际深度。"
         extras = [{**valid, "title": "先看读数", "text": "报告列出了最终的井深。"},
                   {**valid, "title": "解释数据", "text": "这个深度来自现场测量。"}]
@@ -71,6 +71,7 @@ class EditorialTests(unittest.TestCase):
                          [valid["text"], corrected, *(row["text"] for row in extras)])
         revised = model.call_args_list[1].args[1]["scenes"]
         self.assertEqual([row["unsupported_numbers"] for row in revised], [["3000"]])
+        self.assertTrue(revised[0]["incomplete"])
 
     def test_changing_one_report_preserves_unrelated_chapter(self):
         from core.editorial import plan_chapters

@@ -793,6 +793,24 @@ a {
   background: #ffffff;
 }
 
+.g-btn:disabled {
+  opacity: .45;
+  cursor: default;
+  transform: none;
+}
+
+#release-confirmation {
+  width: min(420px, 90vw);
+  padding: 24px;
+  border: 1px solid rgba(255,255,255,.24);
+  border-radius: 16px;
+  background: #152c36;
+  color: white;
+}
+
+#release-confirmation::backdrop { background: rgba(0,0,0,.52); }
+#release-confirmation form { display: flex; justify-content: flex-end; gap: 8px; }
+
 .g-input {
   height: calc(34 * var(--u));
   padding: 0 calc(13 * var(--u));
@@ -1259,6 +1277,7 @@ const STATE = {
   articleCat: "all",
   articleSearch: "",
   storyMode: "scenes",
+  publishing: false,
   accountPlatform: "douyin",
   accountVideos: { douyin: { items: [], next: null }, bilibili: { items: [], next: null } },
   data: window.__EMBEDDED_STATE__ || {}
@@ -1324,6 +1343,7 @@ async function syncState() {
 }
 
 async function runAction(action, payload = {}, platform = STATE.platform) {
+  const day = STATE.day;
   if (!STATE.live) {
     if (action === "select_story") {
       const ed = activeEdition();
@@ -1356,15 +1376,15 @@ async function runAction(action, payload = {}, platform = STATE.platform) {
     const res = await fetch("/api/action", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action, day: STATE.day, platform, payload })
+      body: JSON.stringify({ action, day, platform, payload })
     });
     const out = await res.json();
-    if (!res.ok || !out.ok) throw new Error(out.error || "执行失败");
     if (out.edition) {
-      STATE.data.edition = out.edition;
       STATE.data.editions_by_day = STATE.data.editions_by_day || {};
-      STATE.data.editions_by_day[STATE.day] = out.edition;
+      STATE.data.editions_by_day[day] = out.edition;
+      if (STATE.day === day) STATE.data.edition = out.edition;
     }
+    if (!res.ok || !out.ok) throw new Error(out.error || "执行失败");
     if (out.intake) STATE.data.intake = out.intake;
     if (out.accounts) STATE.data.accounts = out.accounts;
     if (out.copywriting) STATE.data.copywriting = out.copywriting;
@@ -1726,7 +1746,9 @@ function openManualPrompt() {
 function renderScreeningDeck(header, body) {
   const item = activeItem();
   const rel = item.release || {};
-  const pMeta = PLATFORMS[STATE.platform];
+  const platform = STATE.platform;
+  const pMeta = PLATFORMS[platform];
+  const canPublish = STATE.live && rel.state_code === "eligible" && !STATE.publishing;
   const videoUrl = resolveMedia(rel.video_url, rel.video);
   const coverUrl = resolveMedia(rel.cover_url, rel.cover);
   const schedOn = Boolean(STATE.data.schedule_enabled);
@@ -1741,7 +1763,6 @@ function renderScreeningDeck(header, body) {
         每日 08:30 定时: ${schedOn ? '已开启' : '未开启'}
       </button>
       <button class="g-btn" onclick="navigator.clipboard?.writeText(activeItem().release?.caption||'');toast('已复制发布配文与署名');">复制配文</button>
-      <button class="g-btn primary" onclick="runAction('browser_post', {open_browser: true}, STATE.platform)">唤醒插件装填</button>
       <button class="g-btn" onclick="openTab('dashboard')">返回全景</button>
     </div>
   `;
@@ -1760,19 +1781,48 @@ function renderScreeningDeck(header, body) {
 
       <div class="g-panel" style="display:flex;flex-direction:column;gap:calc(10*var(--u));">
         <div style="font-weight:600;font-size:calc(13.5*var(--u));">发布配文与 Wikimedia CC 授权署名</div>
+        <div class="deck-sub" role="status">投稿账号 ${esc(rel.account || '未登录')}${rel.receipt_id ? ` · 稿件编号 ${esc(rel.receipt_id)}` : ''}</div>
         <textarea class="g-input" readonly rows="10"
                   style="width:100%;height:auto;padding:calc(10*var(--u));border-radius:calc(12*var(--u));line-height:1.55;">${esc(rel.caption || '')}</textarea>
         <div style="display:flex;gap:calc(8*var(--u));">
-          <button class="g-btn" style="flex:1;" onclick="runAction('hold', {video: '${esc(rel.video||'')}', hold: ${!rel.held}}, STATE.platform)">
+          <button id="hold-release" class="g-btn" style="flex:1;" ${STATE.live && rel.editable && !STATE.publishing ? '' : 'disabled'}>
             ${rel.held ? '恢复此版发布资格' : '暂缓此版本'}
           </button>
-          <button class="g-btn primary" style="flex:1;" onclick="runAction('publish', {video: '${esc(rel.video||'')}', account: '${esc(rel.identity||'')}'}, STATE.platform)">
-            API 直接投稿
-          </button>
+          ${rel.state_code === 'auth_required' ? `<button class="g-btn primary" onclick="STATE.accountPlatform=STATE.platform;openTab('accounts')">连接${pMeta.name}账号</button>` : ''}
+          ${platform === 'xiaohongshu' && rel.creator_url ? `<a class="g-btn" href="${esc(rel.creator_url)}" target="_blank" rel="noopener">打开创作者后台</a>` : ''}
+          ${platform !== 'xiaohongshu' ? `<button id="submit-release" class="g-btn primary" style="flex:1;" ${canPublish ? '' : 'disabled'}>${STATE.publishing ? '正在上传并提交…' : `提交${pMeta.name}审核`}</button>` : ''}
         </div>
       </div>
     </div>
+    ${canPublish ? `<dialog id="release-confirmation" aria-labelledby="release-confirmation-title">
+      <h2 id="release-confirmation-title">提交${pMeta.name}审核</h2>
+      <p>账号 ${esc(rel.account)}</p>
+      <p>作品 ${esc(rel.title)}</p>
+      <form method="dialog">
+        <button class="g-btn" value="cancel" autofocus>取消</button>
+        <button class="g-btn primary" value="publish">确认提交</button>
+      </form>
+    </dialog>` : ''}
   `;
+  body.querySelector("#hold-release").onclick = () => runAction("hold", {video: rel.video, hold: !rel.held}, platform);
+  if (canPublish) {
+    const confirmation = body.querySelector("#release-confirmation");
+    body.querySelector("#submit-release").onclick = () => {
+      confirmation.returnValue = "cancel";
+      confirmation.showModal();
+    };
+    confirmation.onclose = async () => {
+      if (STATE.publishing || confirmation.returnValue !== "publish") return;
+      STATE.publishing = true;
+      renderStage();
+      try {
+        await runAction("publish", {video: rel.video, account: rel.identity}, platform);
+      } finally {
+        STATE.publishing = false;
+        renderStage();
+      }
+    };
+  }
 }
 
 /* DECK 4: ACCOUNTS & PUBLISHED WORKS */

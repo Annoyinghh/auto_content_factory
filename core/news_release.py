@@ -10,6 +10,13 @@ from pathlib import Path
 import requests
 
 
+MAX_VIDEO_SIZE = 4_000_000_000
+DOUYIN_SINGLE_LIMIT = 128_000_000
+DOUYIN_PART_SIZE = 20_000_000
+BILI_SINGLE_LIMIT = 100_000_000
+BILI_PART_SIZE = 10 * 1024 * 1024
+
+
 class Rejected(RuntimeError):
     """The platform explicitly rejected the request."""
 
@@ -19,20 +26,27 @@ def _douyin_post(operation, token, account, **payload):
 
 
 def _douyin_request(method, path, token, account, *, params=None, **payload):
+    headers = {"access-token": token}
+    if path in {"/video/part/init/", "/video/part/complete/"}:
+        headers["Content-Type"] = "application/json"
     try:
         response = requests.request(
             method, f"https://open.douyin.com{path}",
-            params={"open_id": account, **(params or {})}, headers={"access-token": token},
-            timeout=(8, 150 if "upload" in path else 20), allow_redirects=False, **payload,
+            params={"open_id": account, **(params or {})}, headers=headers,
+            timeout=(8, 150 if "upload" in path or "complete" in path else 20), allow_redirects=False, **payload,
         )
     except requests.RequestException as error:
         raise RuntimeError(f"抖音接口连接失败（{type(error).__name__}）") from error
     if response.status_code != 200:
         raise RuntimeError(f"抖音接口 HTTP {response.status_code}")
-    data = response.json().get("data", {})
-    if str(data.get("error_code")) != "0":
-        if str(data.get("error_code")).isdigit():
-            raise Rejected(f"抖音接口错误码 {data['error_code']}")
+    result = response.json()
+    data = result.get("data") or {}
+    code = data.get("error_code")
+    if code is None and path == "/video/part/upload/":
+        code = (result.get("extra") or {}).get("error_code")
+    if str(code) != "0":
+        if str(code).isdigit():
+            raise Rejected(f"抖音接口错误码 {code}")
         raise RuntimeError("抖音接口返回未知状态。")
     return data
 
@@ -70,12 +84,23 @@ def submit_douyin(package, directory, *, expected_account=None):
     if not token or not account:
         raise RuntimeError("请先配置有 video.create 权限的 DOUYIN_ACCESS_TOKEN 和 DOUYIN_OPEN_ID。")
     video = Path(package["video"])
-    if video.stat().st_size > 128_000_000:
-        raise ValueError("该视频超过抖音单文件上传上限。")
+    size = video.stat().st_size
+    if not 0 < size <= MAX_VIDEO_SIZE:
+        raise ValueError("抖音投稿需要非空视频，最大 4 GB。")
 
     def prepare():
         with video.open("rb") as stream:
-            uploaded = _douyin_post("upload", token, account, files={"video": (video.name, stream, "video/mp4")})
+            if size <= DOUYIN_SINGLE_LIMIT:
+                uploaded = _douyin_post("upload", token, account, files={"video": (video.name, stream, "video/mp4")})
+            else:
+                upload = _douyin_post("part/init", token, account)["upload_id"]
+                # Distribute the remainder so the final part also meets the minimum size.
+                count = (size + DOUYIN_PART_SIZE - 1) // DOUYIN_PART_SIZE
+                part_size = (size + count - 1) // count
+                for number, part in enumerate(iter(lambda: stream.read(part_size), b""), 1):
+                    _douyin_post("part/upload", token, account, params={"upload_id": upload, "part_number": number},
+                                 files={"video": (video.name, part, "video/mp4")})
+                uploaded = _douyin_post("part/complete", token, account, params={"upload_id": upload})
         return uploaded["video"]["video_id"]
 
     def create(video_id):
@@ -87,6 +112,7 @@ def submit_douyin(package, directory, *, expected_account=None):
 
 BILI_MEMBER = "https://member.bilibili.com/arcopen/fn/archive"
 BILI_UPLOAD = "https://openupos.bilivideo.com/video/v2/upload"
+BILI_PART_UPLOAD = "https://openupos.bilivideo.com/video/v2/part/upload"
 
 
 def _bili_post(url, *, credentials=None, json_body=None, method="POST", **payload):
@@ -95,7 +121,7 @@ def _bili_post(url, *, credentials=None, json_body=None, method="POST", **payloa
     if json_body is not None:
         body = json.dumps(json_body, ensure_ascii=False, separators=(",", ":")).encode()
         payload["data"] = body
-    if url == BILI_UPLOAD:
+    if url in {BILI_UPLOAD, BILI_PART_UPLOAD}:
         headers["Content-Type"] = "application/octet-stream"
     elif "files" not in payload:
         headers["Content-Type"] = "application/json"
@@ -110,7 +136,7 @@ def _bili_post(url, *, credentials=None, json_body=None, method="POST", **payloa
         headers.update(signed, Authorization=hmac.new(secret.encode(), message.encode(), "sha256").hexdigest())
         headers["Access-Token"] = token
     try:
-        response = requests.request(method, url, headers=headers, timeout=(8, 150 if "upload" in url else 20),
+        response = requests.request(method, url, headers=headers, timeout=(8, 150 if "upload" in url or "complete" in url else 20),
                                     allow_redirects=False, **payload)
     except requests.RequestException as error:
         raise RuntimeError(f"B站接口连接失败（{type(error).__name__}）") from error
@@ -133,15 +159,25 @@ def submit_bilibili(package, directory, *, expected_account=None):
         raise RuntimeError("请配置 B站应用、投稿分区 ID，并以具有 ARC_BASE 权限的账号登录。")
     video, cover = Path(package["video"]), Path(package["cover"])
     description = package["credit_caption"]
-    if video.stat().st_size > 100_000_000 or cover.stat().st_size > 5_000_000 or len(description) >= 250:
-        raise ValueError("视频、封面或完整署名超过接口上限，请打开 B站创作者后台投稿。")
+    size = video.stat().st_size
+    if not 0 < size <= MAX_VIDEO_SIZE:
+        raise ValueError("B站投稿需要非空视频，最大 4 GB。")
+    if cover.stat().st_size > 5_000_000 or len(description) >= 250:
+        raise ValueError("封面或完整署名超过接口上限，请打开 B站创作者后台投稿。")
+    split = size > BILI_SINGLE_LIMIT
 
     def prepare():
         initialized = _bili_post(f"{BILI_MEMBER}/video/init", credentials=credentials,
-                                 json_body={"name": video.name, "utype": "1"})
+                                 json_body={"name": video.name, "utype": "0" if split else "1"})
         upload_token = initialized["upload_token"]
+        params = {"upload_token": upload_token}
         with video.open("rb") as stream:
-            _bili_post(BILI_UPLOAD, params={"upload_token": upload_token}, data=stream)
+            if split:
+                for number, part in enumerate(iter(lambda: stream.read(BILI_PART_SIZE), b""), 1):
+                    _bili_post(BILI_PART_UPLOAD, params={**params, "part_number": number}, data=part)
+                _bili_post(f"{BILI_MEMBER}/video/complete", credentials=credentials, params=params)
+            else:
+                _bili_post(BILI_UPLOAD, params=params, data=stream)
         with cover.open("rb") as stream:
             uploaded_cover = _bili_post(f"{BILI_MEMBER}/cover/upload", credentials=credentials,
                                         files={"file": (cover.name, stream, "image/png")})

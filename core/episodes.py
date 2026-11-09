@@ -8,6 +8,7 @@ import os
 import re
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 
 from config import PROFILES
 from core.daily_news import story_key
@@ -230,9 +231,12 @@ def _review_chapter(cut, story):
 
 def _numbers(text):
     normalized = unicodedata.normalize("NFKC", text).replace(",", "")
+    normalized = re.sub(r"(\d+(?:\.\d+)?)[ \t]*([万亿])", lambda match: format(
+        (Decimal(match[1]) * CHINESE_UNITS[match[2]]).normalize(), "f"), normalized)
     values = set(re.findall(r"\d+(?:\.\d+)?", normalized))
     quantities = re.findall(
-        f"({CHINESE_QUANTITY})(?=摄氏度|兆帕|分钟|小时|公里|米|年|月|日|比{CHINESE_QUANTITY})", normalized)
+        f"({CHINESE_QUANTITY})(?=(?:多|余)?(?:摄氏度|兆帕|分钟|小时|公里|米|年|月|日|比{CHINESE_QUANTITY}))",
+        normalized)
     quantities += re.findall(rf"(?:{CHINESE_QUANTITY}|\d+)比({CHINESE_QUANTITY})", normalized)
     for quantity in quantities:
         if all(char in CHINESE_DIGITS for char in quantity):

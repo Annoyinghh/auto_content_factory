@@ -442,7 +442,8 @@ class DailyTest(unittest.TestCase):
                       "license_url": "https://creativecommons.org/licenses/by/4.0/",
                       "page_url": "https://commons.wikimedia.org/wiki/File:Test.jpg", "title": "Test media"}
             assets = [{**credit, "kind": "image", "path": str(photo)},
-                      {**credit, "kind": "video", "path": str(footage)}]
+                      {**credit, "kind": "video", "path": str(footage),
+                       "page_url": "https://commons.wikimedia.org/wiki/File:Test.mp4"}]
 
             async def synthesize(_text, _voice, _rate, target):
                 shutil.copyfile(audio, target)
@@ -452,6 +453,13 @@ class DailyTest(unittest.TestCase):
                 patch("core.news_media.download_story_media", return_value=(assets, [])),
                 patch("core.audio_engine._synthesize_text", side_effect=synthesize),
             ):
+                collected = run_stage("collect", NOW.date(), root, now=NOW)
+                for platform in collected["items"]:
+                    run_stage("media", NOW.date(), root, platform)
+                    for asset in assets:
+                        run_stage("review_media", NOW.date(), root, platform,
+                                  {"id": collected["items"][platform].get("id"),
+                                   "page_url": asset["page_url"], "state": "approved"})
                 edition = run_daily(NOW, root)
             for platform, item in edition["items"].items():
                 self.assertEqual(item["status"], "ready", item.get("error"))
