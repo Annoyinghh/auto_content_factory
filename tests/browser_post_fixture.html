@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Browser posting fixture</title>
+<h1>Browser posting fixture</h1>
+<pre id="results">Running…</pre>
+<form id="editor"><button type="submit">发布</button></form>
+<script type="module">
+const source = await (await fetch("/post.js")).text();
+const run = new Function("location", "history", "chrome", "document", "getSelection", source);
+const results = document.getElementById("results");
+const editor = document.getElementById("editor");
+const title = "测试标题";
+const body = "这是文案。\n\n素材署名";
+const filename = "test video.mp4";
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+let submissions = 0;
+editor.addEventListener("submit", event => { submissions++; event.preventDefault(); });
+
+async function exercise(bili, existingDraft = false) {
+  editor.querySelectorAll(".fixture").forEach(node => node.remove());
+  const area = document.createElement("div");
+  area.className = "fixture upload-wrp";
+  area.innerHTML = `<div class="bcc-upload-wrapper"><input type="file" accept="${bili ? '.mp4,.mov' : 'video/*'}"></div>`;
+  editor.prepend(area);
+  if (bili) {
+    const unused = document.createElement("input");
+    unused.className = "fixture";
+    unused.type = "file";
+    unused.accept = ".mp4";
+    editor.append(unused);
+  }
+  const video = area.querySelector("input");
+  let received;
+  video.addEventListener("change", () => {
+    received = video.files[0];
+    area.innerHTML = `<input placeholder="请输入${bili ? '稿件' : '作品'}标题">` + (bili
+      ? '<textarea placeholder="请输入简介"></textarea>'
+      : '<div contenteditable="true" aria-label="作品描述"></div>');
+    area.querySelector("input").value = existingDraft ? "已手工填写" : "test video";
+  });
+
+  const url = new URL(bili ? "https://member.bilibili.com/platform/upload/video/frame" : "https://creator.douyin.com/creator-micro/content/upload");
+  url.hash = "acf-post=12345." + "a".repeat(64);
+  const messages = [];
+  const outcome = await new Promise((resolve, reject) => {
+    const deadline = setTimeout(() => reject(new Error("Timed out")), 4000);
+    const runtime = { async sendMessage({ action, status }) {
+      messages.push(action);
+      if (action === "job") return { job: { title, body, filename } };
+      if (action === "video") return { blob: new Blob(["video fixture"], {type: "video/mp4"}) };
+      clearTimeout(deadline);
+      resolve(status);
+    } };
+    run(url, { replaceState() {} }, { runtime }, document, getSelection.bind(window));
+  });
+  assert(messages.join() === "job,video,result", "unexpected browser actions");
+  assert(received?.name === filename && await received.text() === "video fixture", "selected file mismatch");
+  assert(outcome === (existingDraft ? "partial" : "ready"), `unexpected result: ${outcome}`);
+  assert(area.querySelector("input").value === (existingDraft ? "已手工填写" : title), "title mismatch");
+  const text = area.querySelector("textarea,[contenteditable]");
+  assert((text.value ?? text.innerText).trim() === body, "caption mismatch");
+  assert(submissions === 0, "unexpected publication");
+}
+
+try {
+  await exercise(true);
+  await exercise(false);
+  await exercise(true, true);
+  results.textContent = "PASS: Bilibili, Douyin, existing title preserved, publish untouched";
+} catch (error) {
+  results.textContent = "FAIL: " + error.message;
+}
+</script>

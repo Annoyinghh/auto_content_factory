@@ -1,0 +1,22 @@
+# Python environment and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local data, credentials, and generated files
+/.env
+/.env.*
+*.pem
+*.key
+*.log
+*.sqlite3
+/output/
+/test_output_*/
+/desktop-check.txt
+
+# Windows packaging outputs
+/build/
+/dist/
+/*.spec

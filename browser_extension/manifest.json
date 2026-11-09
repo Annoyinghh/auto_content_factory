@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "minimum_chrome_version": "148",
+  "message_serialization": "structured_clone",
+  "name": "内容工厂 · 投稿助手",
+  "version": "1.0.0",
+  "description": "接收内容工厂当前成片，在抖音和 B 站投稿页上传视频、填写标题和文案。发布由你确认。",
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [{
+    "matches": [
+      "https://creator.douyin.com/creator-micro/content/upload*",
+      "https://member.bilibili.com/platform/upload/video/frame*"
+    ],
+    "js": ["post.js"]
+  }]
+}
