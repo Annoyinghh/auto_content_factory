@@ -17,11 +17,14 @@ const assert = (condition, message) => { if (!condition) throw new Error(message
 let submissions = 0;
 editor.addEventListener("submit", event => { submissions++; event.preventDefault(); });
 
-async function exercise(bili, existingDraft = false) {
+async function exercise(platform, existingDraft = false, image = false) {
+  const bili = platform === "bilibili";
+  const xhs = platform === "xiaohongshu";
   editor.querySelectorAll(".fixture").forEach(node => node.remove());
   const area = document.createElement("div");
   area.className = "fixture upload-wrp";
-  area.innerHTML = `<div class="bcc-upload-wrapper"><input type="file" accept="${bili ? '.mp4,.mov' : 'video/*'}"></div>`;
+  const accept = image ? ".jpg,.jpeg,.png,.webp" : bili ? ".mp4,.mov" : "video/*";
+  area.innerHTML = `<div class="bcc-upload-wrapper"><input type="file" accept="${accept}" ${image ? 'multiple' : ''}></div>`;
   editor.prepend(area);
   if (bili) {
     const unused = document.createElement("input");
@@ -33,29 +36,46 @@ async function exercise(bili, existingDraft = false) {
   const video = area.querySelector("input");
   let received;
   video.addEventListener("change", () => {
-    received = video.files[0];
-    area.innerHTML = `<input placeholder="请输入${bili ? '稿件' : '作品'}标题">` + (bili
+    received = [...video.files];
+    const placeholder = xhs ? "填写标题会有更多赞哦～" : bili ? "请输入稿件标题" : "请输入作品标题";
+    area.innerHTML = `<input placeholder="${placeholder}">` + (bili
       ? '<textarea placeholder="请输入简介"></textarea>'
+      : xhs ? '<div id="post-textarea"><div contenteditable="true"></div></div>'
       : '<div contenteditable="true" aria-label="作品描述"></div>');
-    area.querySelector("input").value = existingDraft ? "已手工填写" : "test video";
+    area.querySelector("input").value = existingDraft ? "已手工填写" : image ? "" : "test video";
   });
 
-  const url = new URL(bili ? "https://member.bilibili.com/platform/upload/video/frame" : "https://creator.douyin.com/creator-micro/content/upload");
+  const url = new URL({
+    bilibili: "https://member.bilibili.com/platform/upload/video/frame",
+    douyin: "https://creator.douyin.com/creator-micro/content/upload",
+    xiaohongshu: "https://creator.xiaohongshu.com/publish/publish?source=official&target=video",
+  }[platform]);
+  if (image) url.searchParams.set("target", "image");
+  const images = [{ name: "cover.jpg", type: "image/jpeg" }, { name: "page.png", type: "image/png" }];
   url.hash = "acf-post=12345." + "a".repeat(64);
   const messages = [];
   const outcome = await new Promise((resolve, reject) => {
     const deadline = setTimeout(() => reject(new Error("Timed out")), 4000);
-    const runtime = { async sendMessage({ action, status }) {
+    const runtime = { async sendMessage({ action, status, index }) {
       messages.push(action);
-      if (action === "job") return { job: { title, body, filename } };
+      if (action === "job") return { job: { title, body, filename, images } };
       if (action === "video") return { blob: new Blob(["video fixture"], {type: "video/mp4"}) };
+      if (action === "asset") return { blob: new Blob(["image " + index], {type: images[index].type}) };
       clearTimeout(deadline);
       resolve(status);
     } };
     run(url, { replaceState() {} }, { runtime }, document, getSelection.bind(window));
   });
-  assert(messages.join() === "job,video,result", "unexpected browser actions");
-  assert(received?.name === filename && await received.text() === "video fixture", "selected file mismatch");
+  assert(messages.join() === (image ? "job,asset,asset,result" : "job,video,result"), "unexpected browser actions");
+  if (image) {
+    assert(received.length === 2, "missing picture");
+    for (const [index, file] of received.entries()) {
+      assert(file.name === images[index].name && file.type === images[index].type && await file.text() === "image " + index,
+        "image order or content mismatch");
+    }
+  } else {
+    assert(received.length === 1 && received[0].name === filename && await received[0].text() === "video fixture", "selected file mismatch");
+  }
   assert(outcome === (existingDraft ? "partial" : "ready"), `unexpected result: ${outcome}`);
   assert(area.querySelector("input").value === (existingDraft ? "已手工填写" : title), "title mismatch");
   const text = area.querySelector("textarea,[contenteditable]");
@@ -64,10 +84,12 @@ async function exercise(bili, existingDraft = false) {
 }
 
 try {
-  await exercise(true);
-  await exercise(false);
-  await exercise(true, true);
-  results.textContent = "PASS: Bilibili, Douyin, existing title preserved, publish untouched";
+  await exercise("bilibili");
+  await exercise("douyin");
+  await exercise("xiaohongshu");
+  await exercise("xiaohongshu", true);
+  await exercise("xiaohongshu", false, true);
+  results.textContent = "PASS: Bilibili, Douyin, Xiaohongshu video and images, existing title preserved, publish untouched";
 } catch (error) {
   results.textContent = "FAIL: " + error.message;
 }

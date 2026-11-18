@@ -72,8 +72,8 @@ class AccountDesk:
         self.refresh.configure(state="normal" if available else "disabled")
         self.settings.configure(state="normal" if available else "disabled")
         if available:
-            label, _ = account_hint(platform)
-            self.status.configure(text=label)
+            label, identity = account_hint(platform)
+            self.status.configure(text=label if identity else "个人号可在创作者后台登录。开放平台授权用于 API 投稿和读取作品。")
         else:
             self.status.configure(text="小红书作品可在官方创作者后台登录、管理和发布。")
 

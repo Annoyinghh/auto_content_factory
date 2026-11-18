@@ -6,12 +6,16 @@ Audio Synthesis and Subtitle Alignment Engine
 import os
 import asyncio
 import subprocess
+import wave
+import hashlib
+import shutil
 from pathlib import Path
 import edge_tts
 
 from config import get_ffmpeg, PLATFORM_PRESETS
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+EDGE_SCENE_TIMEOUT = 45
 WINDOWS_SPEECH = """
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Speech
@@ -28,9 +32,9 @@ try {
 } finally { $synth.Dispose() }
 """
 
-def get_audio_duration(file_path: str) -> float:
-    """Uses ffmpeg to probe exact audio duration in seconds."""
-    cmd = [get_ffmpeg(), "-i", file_path]
+def get_audio_duration(file_path: str, *, strict=False) -> float:
+    """Uses ffmpeg to probe media duration in seconds."""
+    cmd = [get_ffmpeg(), "-nostdin", "-i", file_path]
     res = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="ignore",
                          creationflags=NO_WINDOW)
     for line in res.stderr.split("\n"):
@@ -41,6 +45,8 @@ def get_audio_duration(file_path: str) -> float:
             mins = float(parts[1])
             secs = float(parts[2])
             return hours * 3600 + mins * 60 + secs
+    if strict:
+        raise RuntimeError(f"无法读取媒体时长：{Path(file_path).name}")
     return 5.0 # fallback
 
 def format_ass_time(seconds: float) -> str:
@@ -67,7 +73,7 @@ async def _synthesize_text(text: str, voice: str, rate: str, output_path: str, m
     for attempt in range(1, max_retries + 1):
         try:
             communicate = edge_tts.Communicate(text, voice, rate=rate, connect_timeout=10, receive_timeout=30)
-            await communicate.save(output_path)
+            await asyncio.wait_for(communicate.save(output_path), timeout=EDGE_SCENE_TIMEOUT)
             if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
                 return
         except Exception as e:
@@ -98,6 +104,38 @@ def _synthesize_windows(text, voice, rate, output):
         text_file.unlink(missing_ok=True)
         wav.unlink(missing_ok=True)
 
+
+def _assemble_speech(scene_files, master):
+    # Decode each clip independently so MP3 encoder padding never becomes narration time.
+    sample_rate = 24_000
+    pcm_file = master.with_suffix(".partial.wav")
+    encoded = master.with_suffix(".partial.mp3")
+    durations = []
+    try:
+        with wave.open(str(pcm_file), "wb") as track:
+            track.setparams((1, 2, sample_rate, 0, "NONE", "not compressed"))
+            for source in scene_files:
+                decoded = subprocess.run(
+                    [get_ffmpeg(), "-nostdin", "-loglevel", "error", "-i", str(source), "-map", "0:a:0",
+                     "-ac", "1", "-ar", str(sample_rate), "-f", "s16le", "pipe:1"],
+                    capture_output=True, check=True, timeout=30, creationflags=NO_WINDOW,
+                ).stdout
+                if not decoded or len(decoded) % 2:
+                    raise RuntimeError(f"配音片段无法解码：{source.name}")
+                track.writeframesraw(decoded)
+                durations.append(len(decoded) / (2 * sample_rate))
+        subprocess.run(
+            [get_ffmpeg(), "-nostdin", "-loglevel", "error", "-y", "-i", str(pcm_file),
+             "-c:a", "libmp3lame", "-b:a", "96k", str(encoded)],
+            capture_output=True, check=True, timeout=150, creationflags=NO_WINDOW,
+        )
+        encoded.replace(master)
+        return durations
+    finally:
+        pcm_file.unlink(missing_ok=True)
+        encoded.unlink(missing_ok=True)
+
+
 def generate_voice_and_subtitles(case: dict, platform: str, output_dir: Path) -> dict:
     """
     Synthesizes speech for all scenes in the case, concatenates them,
@@ -110,12 +148,26 @@ def generate_voice_and_subtitles(case: dict, platform: str, output_dir: Path) ->
     
     scenes = case["scenes"]
     scene_audios = []
-    scene_durations = []
     offline_voice = False
+    speech_cache=output_dir.parent/'.speech-cache-v1' if case.get('resume') else None
+    if speech_cache:
+        speech_cache.mkdir(exist_ok=True)
     
     # 1. Synthesize each scene audio
     for idx, sc in enumerate(scenes):
         scene_mp3 = output_dir / f"scene_{idx:02d}.mp3"
+        cached=None
+        valid_cache=False
+        if speech_cache:
+            key=hashlib.sha256('\0'.join((voice,rate,sc['text'])).encode('utf-8')).hexdigest()
+            cached=speech_cache/(key+'.mp3')
+            if cached.is_file():
+                try:
+                    valid_cache=get_audio_duration(cached,strict=True)>0
+                except (OSError,RuntimeError):
+                    pass
+            if valid_cache and not scene_mp3.is_file():
+                shutil.copyfile(cached,scene_mp3)
         if not (case.get("resume") and scene_mp3.is_file()):
             partial = scene_mp3.with_suffix(".partial.mp3")
             if not offline_voice:
@@ -128,26 +180,17 @@ def generate_voice_and_subtitles(case: dict, platform: str, output_dir: Path) ->
             if offline_voice:
                 _synthesize_windows(sc["text"], voice, rate, partial)
             partial.replace(scene_mp3)
-        duration = get_audio_duration(str(scene_mp3))
+        if cached and not valid_cache:
+            pending=cached.with_suffix('.partial.mp3')
+            shutil.copyfile(scene_mp3,pending)
+            pending.replace(cached)
         scene_audios.append(scene_mp3)
-        scene_durations.append(duration)
-        sc["duration"] = duration
 
-    # 2. Concat all scene audios into master speech.mp3 using ffmpeg
-    concat_list_file = output_dir / "concat_audio.txt"
-    with open(concat_list_file, "w", encoding="utf-8") as f:
-        for p in scene_audios:
-            f.write(f"file '{p.name}'\n")
-            
     master_audio = output_dir / "speech.mp3"
-    cmd_concat = [
-        get_ffmpeg(), "-y", "-f", "concat", "-safe", "0",
-        "-i", concat_list_file.name,
-        "-c", "copy", master_audio.name
-    ]
-    subprocess.run(cmd_concat, cwd=output_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
-                   creationflags=NO_WINDOW)
-    total_duration = get_audio_duration(str(master_audio))
+    scene_durations = _assemble_speech(scene_audios, master_audio)
+    for scene, duration in zip(scenes, scene_durations, strict=True):
+        scene["duration"] = duration
+    total_duration = sum(scene_durations)
 
     # 3. Generate Subtitles (ASS & SRT)
     # Split each scene text into short, punchy clauses for mobile reading
@@ -187,6 +230,8 @@ def generate_voice_and_subtitles(case: dict, platform: str, output_dir: Path) ->
     # Build ASS content (Advanced SubStation Alpha with custom styling)
     sub_fontsize = preset.get("sub_fontsize", 48)
     sub_margin_v = preset.get("sub_bottom_margin", 320)
+    if case.get('news_frame') == 'source-news-v1':
+        sub_margin_v = round(preset['height'] * (.065 if preset['width'] > preset['height'] else .115))
     w = preset["width"]
     h = preset["height"]
 

@@ -52,6 +52,64 @@ def scratch_dir():
 
 
 class DailyTest(unittest.TestCase):
+    def test_deliberate_writing_can_enable_local_reasoning_without_changing_visual_requests(self):
+        from core.local_ai import chat_json
+        with patch('core.local_ai.model_for',return_value='writer'), patch('requests.Session') as session:
+            post=session.return_value.__enter__.return_value.post
+            post.return_value.status_code=200
+            post.return_value.json.return_value={'message':{'content':'{}'}}
+            chat_json('核对原文',{}, {'type':'object'},reasoning=True,max_tokens=4096)
+            self.assertIs(post.call_args.kwargs['json']['think'],True)
+            self.assertEqual(post.call_args.kwargs['json']['options']['num_predict'],4096)
+            chat_json('看图',{}, {'type':'object'})
+            self.assertIs(post.call_args.kwargs['json']['think'],False)
+
+    def test_cpu_runtime_uses_its_own_endpoint_and_preserves_the_gpu_service(self):
+        from core.local_ai import start_portable_ai
+        with scratch_dir() as root:
+            runtime=root/'local-ai/runtime'
+            runtime.mkdir(parents=True)
+            (runtime/'ollama.exe').touch()
+            with (patch.dict(os.environ,{'ACF_STUDIO_ROOT':str(root),'CONTENT_AI_GPU':'0'},clear=True),
+                  patch('core.local_ai.socket.create_connection',side_effect=ConnectionRefusedError),
+                  patch('core.local_ai.subprocess.Popen') as spawn):
+                start_portable_ai()
+                env=spawn.call_args.kwargs['env']
+                self.assertEqual(env['OLLAMA_HOST'],'127.0.0.1:11517')
+                self.assertEqual(env['CUDA_VISIBLE_DEVICES'],'-1')
+
+    def test_cpu_mode_applies_to_writing_and_vision_requests(self):
+        from core.local_ai import chat_json
+        with (patch.dict(os.environ, {'CONTENT_AI_GPU':'0'}),
+              patch('core.local_ai.model_for',side_effect=lambda role:{'writing':'writer','design':'director','editing':'vision'}[role]),
+              patch('requests.Session') as session):
+            post = session.return_value.__enter__.return_value.post
+            post.return_value.status_code = 200
+            post.return_value.json.return_value = {'message':{'content':'{}'}}
+            for model in ('writer','vision'):
+                chat_json('核对资料',{}, {'type':'object'},model=model)
+                self.assertEqual(post.call_args.kwargs['json']['options']['num_gpu'],0)
+
+    def test_portable_ai_waits_for_http_after_ollama_opens_its_port(self):
+        from requests import ReadTimeout
+        from core.local_ai import start_portable_ai
+
+        ready = Response()
+        ready.status_code = 200
+        with scratch_dir() as root:
+            runtime = root / "local-ai" / "runtime"
+            runtime.mkdir(parents=True)
+            (runtime / "ollama.exe").touch()
+            with (patch.dict(os.environ, {"ACF_STUDIO_ROOT": str(root), "CONTENT_AI_MODEL": "qwen3.5:4b"}),
+                  patch("core.local_ai.socket.create_connection"), patch("core.local_ai.subprocess.Popen") as spawn,
+                  patch("core.local_ai.time.sleep"), patch("requests.Session") as session):
+                get = session.return_value.__enter__.return_value.get
+                get.side_effect = [ReadTimeout(), ready]
+                start_portable_ai(wait=True)
+                self.assertEqual(get.call_count, 2)
+                self.assertTrue(get.call_args.args[0].endswith("/api/version"))
+                spawn.assert_not_called()
+
     def test_intake_prunes_old_articles_and_queues_a_real_rank_match(self):
         from core.intake import refresh_intake
 
@@ -191,6 +249,32 @@ class DailyTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "意外退出（47）"):
                     run_worker("ai", NOW.date(), root, "xiaohongshu")
             self.assertTrue(run_worker("draft", NOW.date(), root, "xiaohongshu")["scenes"])
+
+    def test_storyboard_save_rejects_a_stale_editor_snapshot(self):
+        with scratch_dir() as root:
+            day, platform = NOW.date(), "xiaohongshu"
+            with patch("core.daily_news.collect_news", return_value=(parse_feed(FEED, NOW), [])):
+                run_stage("collect", day, root, now=NOW)
+
+            first = run_stage("draft", day, root, platform, {"with_revision": True})
+            second = run_stage("draft", day, root, platform, {"with_revision": True})
+            self.assertEqual(first, second)
+            self.assertEqual(first.get("draft"), run_stage("draft", day, root, platform))
+            self.assertIsNone(first["edit_revision"])
+
+            def save(snapshot, text):
+                scenes = snapshot["draft"]["scenes"]
+                return run_stage("save", day, root, platform, {
+                    "scenes": [{**scenes[0], "text": text}, *scenes[1:]],
+                    "episode_id": snapshot["episode_id"],
+                    "expected_revision": snapshot["edit_revision"],
+                    "expected_suggestion_revision": snapshot["suggestion_revision"],
+                })
+
+            newer = save(second, "第二个编辑窗口已保存。")
+            with self.assertRaisesRegex(RuntimeError, "草稿已更新"):
+                save(first, "第一个编辑窗口仍有旧草稿。")
+            self.assertEqual(run_stage("draft", day, root, platform), newer)
 
     @unittest.skipUnless(os.name == "nt", "Windows process lifetime")
     def test_worker_timeout_stops_its_child_process(self):

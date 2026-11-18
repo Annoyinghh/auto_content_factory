@@ -1,6 +1,7 @@
 """Editorial drafts and optional local AI cut suggestions."""
 
 import re
+import math
 
 from config import PLATFORM_PRESETS, PROFILES
 from core.daily_news import story_key
@@ -85,12 +86,14 @@ def default_cut(item, platform):
     ]}
 
 
-def validate_cut(draft, media, *, episode=False):
+def validate_cut(draft, media, *, episode=False, minimum=SCENE_COUNT[0]):
     scenes = draft.get("scenes") if isinstance(draft, dict) else None
     maximum = 96 if episode else SCENE_COUNT[1]
-    if not isinstance(scenes, list) or not SCENE_COUNT[0] <= len(scenes) <= maximum:
-        raise ValueError(f"剪辑草稿应包含 2–{maximum} 个分镜。")
-    permitted = {"", *(asset["page_url"] for asset in media)}
+    if type(minimum) is not int or minimum not in (1, SCENE_COUNT[0]):
+        raise ValueError("分镜最小数量无效。")
+    if not isinstance(scenes, list) or not minimum <= len(scenes) <= maximum:
+        raise ValueError(f"剪辑草稿应包含 {minimum}–{maximum} 个分镜。")
+    permitted = {asset["page_url"]: asset for asset in media}
     clean = []
     for scene in scenes:
         if not isinstance(scene, dict):
@@ -100,17 +103,92 @@ def validate_cut(draft, media, *, episode=False):
             raise ValueError("每个分镜需要 1–36 字标题。")
         if not isinstance(text, str) or not 1 <= len(text.strip()) <= TEXT_LIMITS["text"]:
             raise ValueError("每个分镜需要 1–280 字口播。")
-        if not isinstance(asset, str) or asset not in permitted or type(zoom) is not bool:
+        if not isinstance(asset, str) or (asset and asset not in permitted) or type(zoom) is not bool:
             raise ValueError("分镜只能使用当前稿件已导入或已采集的素材。")
+        if asset and permitted[asset].get("comparison"):
+            from core.comparison_media import matches_comparison
+
+            if not matches_comparison(permitted[asset], text):
+                raise ValueError("使用同屏对照时，口播需包含两个样本名和共同条件。")
         shot = {"title": title.strip(), "text": " ".join(text.split()), "media": asset, "zoom": zoom}
+        if 'evidence' in scene:
+            citations = scene['evidence']
+            if (not isinstance(citations, list) or not 1 <= len(citations) <= 3
+                    or any(not isinstance(row, dict) or not isinstance(row.get('source_id'), str)
+                           or not 1 <= len(row['source_id']) <= 200 or not isinstance(row.get('quote'), str)
+                           or not 8 <= len(row['quote'].strip()) <= 12000 for row in citations)):
+                raise ValueError('分镜原文出处无效，请重新核对资料。')
+            shot['evidence'] = [{key: row[key] for key in ('source_id', 'quote')} for row in citations]
         if "motion" in scene:
             from core.episodes import MOTIONS
             motion = scene["motion"]
             if not isinstance(motion, str) or motion not in MOTIONS:
                 raise ValueError("分镜动效超出支持范围。")
             shot["motion"] = motion
+        if "visual" in scene:
+            from core.directing import DIAGRAMS, FRAMINGS, LAYOUTS
+            from core.video_styles import diagram_labels
+
+            visual = scene["visual"]
+            if not isinstance(visual, dict) or visual.get("layout") not in LAYOUTS or visual.get("framing") not in FRAMINGS:
+                raise ValueError("视觉方案不完整。")
+            start = visual.get("start")
+            source = permitted.get(asset, {})
+            duration = source.get("duration") or 0
+            if (bool(asset) != (visual["layout"] == "footage") or type(start) not in {int, float}
+                    or not (start == 0 or source.get("kind") == "video" and 0 < start < duration)
+                    or any(not isinstance(visual.get(field), str) or not 1 <= len(visual[field]) <= 70
+                           for field in ("intent", "reason"))):
+                raise ValueError("视觉方案的素材入点或画面说明无效。")
+            shot["visual"] = {field: visual[field] for field in ("layout", "framing", "start", "intent", "reason")}
+            if "end" in visual:
+                end = visual["end"]
+                if (source.get("kind") != "video" or type(end) not in {int,float}
+                        or not math.isfinite(end) or not start < end <= duration):
+                    raise ValueError("视觉方案的原片出点无效。")
+                shot["visual"]["end"] = end
+            if "clips" in visual:
+                clips = visual['clips']
+                if (visual['layout'] != 'footage' or not isinstance(clips,list) or not 1 <= len(clips) <= 6):
+                    raise ValueError('连续选镜需要 1–6 段已选原片。')
+                selected,seen = [],set()
+                for clip in clips:
+                    if not isinstance(clip,dict):
+                        raise ValueError('连续选镜的片段格式无效。')
+                    entry=permitted.get(clip.get('media')) or {}
+                    left,right=clip.get('start'),clip.get('end')
+                    if (entry.get('kind') != 'video' or type(left) not in (int,float)
+                            or type(right) not in (int,float) or not math.isfinite(left+right)
+                            or not 0 <= left < right <= entry.get('duration',0)
+                            or any(not isinstance(clip.get(key),str) or not 1 <= len(clip[key]) <= 70
+                                   for key in ('intent','reason'))):
+                        raise ValueError('连续选镜只能使用当前素材中有效的原片片段。')
+                    identity=(clip['media'],left,right)
+                    if identity in seen:
+                        raise ValueError('同一段连续选镜不能重复使用同一个片段。')
+                    seen.add(identity)
+                    selected.append({key:clip[key] for key in ('media','start','end','intent','reason')})
+                    if 'for_text' in clip:
+                        if not isinstance(clip['for_text'],str) or len(clip['for_text'])<2 or clip['for_text'] not in shot['text']:
+                            raise ValueError('连续选镜的口播摘录与本分镜不一致。')
+                        selected[-1]['for_text']=clip['for_text']
+                if (selected[0]['media'],selected[0]['start'],selected[0]['end']) != (asset,start,visual.get('end')):
+                    raise ValueError('连续选镜的首段需与当前分镜一致。')
+                shot['visual']['clips']=selected
+            if visual["layout"] in DIAGRAMS:
+                labels = diagram_labels(visual["layout"], visual.get("labels"), shot["text"])
+                if not labels:
+                    raise ValueError("图解需要使用口播中实际出现的标注。")
+                shot["visual"]["labels"] = labels
         clean.append(shot)
-    return {"scenes": clean}
+    cut = {"scenes": clean}
+    if "confirmed_scenes" in draft:
+        indexes = draft["confirmed_scenes"]
+        if (not isinstance(indexes, list)
+                or any(type(index) is not int or not 0 <= index < len(clean) for index in indexes)):
+            raise ValueError("已确认分镜的编号无效。")
+        cut["confirmed_scenes"] = sorted(set(indexes))
+    return cut
 
 
 def render_case(item, platform):
@@ -132,21 +210,71 @@ def render_case(item, platform):
             "news": {"series": "自拟选题", "source": story["source"], "source_url": ""},
         }
     media = {asset["page_url"]: asset for asset in item.get("media", ())}
+    reports = [story, *(item.get('editorial') or {}).get('reports', []),
+               *(report for chapter in item.get('chapters', [])
+                 for report in chapter.get('reports', [chapter['story']]))]
+    sources = {report.get('id') or story_key(report): report for report in reports}
     used = {}
     case["scenes"] = []
     for index, shot in enumerate(cut["scenes"]):
         scene = {"title": shot["title"], "card_title": shot["title"], "text": shot["text"],
-                 "card_desc": case["title"] if index == 0 else shot["text"], "zoom": shot["zoom"]}
+                 "card_desc": case["title"] if index == 0 else shot["text"], "zoom": shot["zoom"],
+                 'narration_group':index}
+        if shot.get('evidence'):
+            scene['evidence'] = [{**citation, **{key: sources[citation['source_id']][key]
+                                   for key in ('source', 'title', 'url', 'published')
+                                   if key in sources[citation['source_id']]}}
+                                if citation['source_id'] in sources else dict(citation)
+                                for citation in shot['evidence']]
         if "motion" in shot:
             scene["motion"] = shot["motion"]
         asset = media.get(shot["media"])
+        if asset and asset.get("comparison"):
+            from core.comparison_media import matches_comparison
+
+            if not matches_comparison(asset, shot["text"]):
+                asset = None
         if asset:
             scene["asset"] = used[shot["media"]] = asset
+            if asset.get("comparison"):
+                scene.update(motion="cut", zoom=False)
+        if visual := shot.get("visual"):
+            scene["visual"] = visual if asset or visual["layout"] != "footage" else {
+                **visual, "layout": "evidence", "start": 0, "reason": "原素材已撤下，使用报道图卡"}
+            if asset and visual['layout'] == 'footage':
+                scene.update(layout='footage',clip_group=index)
+            if visual.get('clips'):
+                refs=(cut.get('editorial_plan') or {}).get('indexed_scene_refs',{})
+                scene['context_sequence']=refs.get(str(index),{}).get('usage') == 'context'
+                sequence=[]
+                for clip in visual['clips']:
+                    if clip['media'] not in media:
+                        raise RuntimeError('连续选镜中的素材已撤下，请重新选镜。')
+                    selected=used[clip['media']]=media[clip['media']]
+                    sequence.append({**clip,'asset':selected})
+                scene['visual']={**scene['visual'],'clips':sequence}
+        if asset and asset.get("comparison"):
+            scene.update(layout="footage", clip_group=index, visual={"layout": "footage", "start": 0,
+                         "framing": "fit", "intent": "双样本同屏对照", "reason": "沿用已确认的同屏素材"})
         case["scenes"].append(scene)
     case["news"]["media"] = list(used.values())
     if item.get("chapters"):
         from core.episodes import split_episode_shots
-        return split_episode_shots(case, item)
+        segments=(cut.get('editorial_plan') or {}).get('narration_segments')
+        if isinstance(segments,dict):
+            case['narration_segments']=segments
+        case = split_episode_shots(case, item)
+    if ((item.get('chapters') or story.get('url'))
+            and (item.get('editorial') or {}).get('mode') != 'original'
+            and (item.get('video_style') or {}).get('id') != 'recipe'):
+        from core.video_sequence import align_source_narration
+        case['news_frame'] = 'source-news-v1'
+        marker_groups = [(mark, case['scenes'][mark['scene']]['narration_group'])
+                         for mark in case.get('chapter_starts', [])]
+        case['scenes'] = align_source_narration(case['scenes'])
+        case['chapter_starts'] = [{**mark, 'scene': next(i for i, scene in enumerate(case['scenes'])
+                                                       if scene['narration_group'] == group)}
+                                 for mark, group in marker_groups]
     return case
 
 

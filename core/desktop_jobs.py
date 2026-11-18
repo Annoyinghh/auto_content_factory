@@ -11,16 +11,21 @@ from pathlib import Path
 from core.workflow import run_stage, write_json
 
 
-DEADLINES = {"collect": 150, "intake": 420, "supplement_hotspots": 300, "select_episode": 600,
-             "editorial_sources": 200, "editorial_create": 30, "editorial_preview": 4200, "editorial_export": 7200,
+DEADLINES = {"topic_prepare": 1200, "topic_produce": 14400,
+             "collect": 150, "intake": 420, "supplement_hotspots": 300, "select_episode": 600,
+             "editorial_sources": 200, "editorial_collect": 300, "editorial_link": 90, "editorial_create": 90,
+             "editorial_preview": 4200, "editorial_export": 7200, "full_preview": 10800,
+             "visual_direct": 5400, "direct_scene": 1800, "auto_cut": 10800, "refresh_writing_library": 600,
              "media": 1200, "ai": 2100, "preview": 1800, "render": 10800, "publish": 900, "login": 90, "videos": 60,
-             "copywriting": 1800, "analyze_case": 220, "import_media": 90, "preview_asset": 100}
+             "copywriting": 1800, "xiaohongshu_notes": 2400, "analyze_case": 220, "collect_writing_cases": 450,
+             "import_media": 120, "preview_asset": 100, "team_share": 1200, "team_flag": 1200,
+             "workspace_ai_start": 150, "workspace_quality_decide": 1200, "workspace_quick_create": 120}
 
 
 def desktop_command():
     command = [sys.executable]
     if not getattr(sys, "frozen", False):
-        command.append(str(Path(__file__).resolve().parents[1] / "desktop.py"))
+        command.append(str(Path(__file__).resolve().parents[1] / "studio_entry.py"))
     return command
 
 
@@ -40,7 +45,8 @@ def run_worker(stage, day, output_dir, platform=None, payload=None, *, now=None)
         })
         command = [*desktop_command(), "--worker", str(request), str(result)]
         timeout = DEADLINES.get(stage, 30)
-        env = {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
+        # The worker inherits the release runtime used by the workbench.
+        env = os.environ.copy()
         try:
             if os.name == "nt":
                 from core.windows_worker import run_in_job
@@ -68,10 +74,33 @@ def worker_main(request, result):
     stamp = command.pop("now")
     now = dt.datetime.fromisoformat(stamp) if stamp else None
     try:
-        if command["stage"] == "login":
+        stage = command["stage"]
+        if stage == "login":
             from core.accounts import unprotect_json
             command["payload"] = unprotect_json(command["payload"])
-        value = run_stage(**command, now=now)
+        if os.getenv("ACF_STUDIO_ROOT") and (stage in {
+            "topic_prepare", "topic_produce", "editorial_preview", "visual_direct", "direct_scene", "auto_cut", "editorial_export", "preview", "render",
+            "copywriting", "xiaohongshu_notes", "ai", "refresh_writing_library", "workspace_media_search",
+        } or stage == "team_compute_once" and (command.get("payload") or {}).get("enabled") is True):
+            from core.local_ai import start_portable_ai
+            start_portable_ai(wait=True)
+        if stage.startswith("workspace_"):
+            from core.wpf_workspace import workspace_stage
+            value = workspace_stage(**command, now=now)
+        elif stage.startswith("team_"):
+            from core.wpf_team import team_stage
+            value = team_stage(**command, now=now)
+        elif stage.startswith("publish_"):
+            from core.wpf_publish import publish_stage
+            value = publish_stage(**command, now=now)
+        elif stage.startswith("cases_"):
+            from core.wpf_cases import cases_stage
+            value = cases_stage(**command, now=now)
+        elif stage.startswith("schedule_"):
+            from core.wpf_schedule import schedule_stage
+            value = schedule_stage(**command, now=now)
+        else:
+            value = run_stage(**command, now=now)
     except Exception as error:
         write_json(Path(result), {"error": str(error) or type(error).__name__})
         return 1

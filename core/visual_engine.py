@@ -4,26 +4,14 @@ Visual Rendering Engine
 """
 
 import os
-from pathlib import Path
+import re
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from config import ASSETS_DIR, FONT_REGULAR, FONT_BOLD, PLATFORM_PRESETS
+from config import ASSETS_DIR, FONT_REGULAR, FONT_BOLD
 
 def get_font(size: int, bold: bool = False):
     font_path = FONT_BOLD if bold and os.path.exists(FONT_BOLD) else FONT_REGULAR
     return ImageFont.truetype(font_path, size)
-
-def create_gradient(width: int, height: int, start_color: tuple, end_color: tuple) -> Image.Image:
-    """Generate vertical linear gradient."""
-    base = Image.new("RGB", (width, height), start_color)
-    top = Image.new("RGB", (width, height), end_color)
-    mask = Image.new("L", (width, height))
-    mask_data = []
-    for y in range(height):
-        mask_data.extend([int(255 * (y / height))] * width)
-    mask.putdata(mask_data)
-    base.paste(top, (0, 0), mask)
-    return base
 
 def wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int, draw: ImageDraw.ImageDraw) -> list:
     """Wrap Chinese & English text into lines based on pixel width."""
@@ -60,9 +48,159 @@ def news_media_box(width, height, *, cover=False):
     return (int(width * 0.07), int(height * 0.15), int(width * 0.93), int(height * (0.55 if cover else 0.49)))
 
 
+def opening_media_box(width, height):
+    wide = width > height
+    ratios = (.055, .17, .653, .773) if wide else (.065, .143, .935, .539)
+    return tuple(round(size * ratio / 2) * 2 for size, ratio in zip((width, height, width, height), ratios))
+
+
+def generate_opening_slide(case, scene, width, height, platform, *, video_overlay):
+    wide = width > height
+    unit = height / (1080 if wide else 1920)
+    x0, y0, x1, y1 = opening_media_box(width, height)
+    right = width - x0
+    ink, muted = "#F5F6F2", "#ACBFCA"
+    accent = {"bilibili": "#78DFCF", "douyin": "#F6D863", "xiaohongshu": "#F0AB9E"}[platform]
+    img = Image.new("RGBA" if video_overlay else "RGB", (width, height), "#101923")
+    asset, report = scene.get("asset"), scene.get("opening_report", {})
+    if video_overlay:
+        img.paste((0, 0, 0, 0), (x0, y0, x1, y1))
+    elif asset and asset.get("preview"):
+        with Image.open(asset["preview"]) as photo:
+            img.paste(ImageOps.fit(photo, (x1-x0, y1-y0)), (x0, y0))
+    draw = ImageDraw.Draw(img)
+
+    def text_block(text, x, y, size, max_width, count, color=ink, bold=False):
+        font = get_font(max(11, round(size * unit)), bold)
+        wrapped = wrap_text(text, font, max_width, draw)
+        for i, line in enumerate(wrapped[:count]):
+            draw.text((x, y), line if i < count-1 or len(wrapped) <= count else line[:-1]+"…", font=font, fill=color)
+            y += round(size * unit * 1.30)
+        return y
+
+    width_label = right - x0
+    text_block("热采资讯  /  本期观察", x0, round(height * .040), 25 if wide else 29, width_label, 1, accent, True)
+    text_block(case["title"], x0, round(height * .079), 43 if wide else 45, width_label, 1, ink, True)
+    draw.line((x0, y0-12, right, y0-12), fill="#355261", width=max(1, round(2*unit)))
+
+    if not asset:
+        draw.rectangle((x0, y0, x1-1, y1-1), fill="#1B2B38")
+        inset = round((x1-x0) * .075)
+        block_width = x1-x0-2*inset
+        y = y0 + round((y1-y0) * .19)
+        text_block("报道速览" if report else "本期线索", x0+inset, y, 28 if wide else 32, block_width, 1, accent, True)
+        draw.rectangle((x0+inset, y+round(48*unit), x0+inset+round(92*unit), y+round(53*unit)), fill=accent)
+        text_block(report.get("title", scene["title"]), x0+inset, y+round(80*unit), 61 if wide else 55,
+                   block_width, 3, ink, True)
+        if report:
+            text_block(report["source"], x0+inset, y1-round(90*unit), 29 if wide else 31, block_width, 1, muted)
+
+    draw.rectangle((x0-2, y0-2, x1+1, y1+1), outline="#52717D", width=2)
+    sx, sy = (round(width * .683), y0) if wide else (x0, round(height * .568))
+    end = y1 if wide else round(height * .749)
+    draw.rectangle((sx, sy, right, end), fill="#172633")
+    pad = round(width * (.019 if wide else .035))
+    content = right-sx-2*pad
+    label = {"image": "资料照片", "video": "资料视频"}.get(asset.get("kind") if asset else None, "报道卡片")
+    if asset and not asset.get("local"):
+        label += "  /  示意画面"
+    text_block(label, sx+pad, sy+round(23*unit), 24 if wide else 27, content, 1, accent, True)
+    title_y = sy+round((78 if wide else 73)*unit)
+    text_block(scene["title"], sx+pad, title_y, 47 if wide else 47, content, 3 if wide else 2, ink, True)
+    attribution = (asset["title"] if asset.get("local") else f"{asset['author']} · {asset['license']}") if asset else ""
+    if report:
+        text_block(f"报道  /  {report['source']}", sx+pad, end-round(98*unit), 25, content, 1, muted)
+    if attribution:
+        text_block(attribution, sx+pad, end-round(54*unit), 23, content, 1, accent)
+
+    for beat in range(5):
+        start = x0 + beat*round(49*unit)
+        y = y1 + round(26*unit) if wide else round(height * .772)
+        draw.rectangle((start, y, start+round(37*unit), y+round(5*unit)),
+                       fill=accent if beat <= scene["opening_beat"] else "#3A5360")
+    return img
+
+
+def _roundup_heading(image, chapter, platform, *, on_footage):
+    width, height = image.size
+    wide = width > height
+    draw = ImageDraw.Draw(image)
+    x = round(width * .065)
+    y = round(height * (.19 if on_footage else .31))
+    label = f"资讯 {chapter['number']:02d} / {chapter['total']:02d}"
+    accent = "#A4E7DC" if platform == "bilibili" else "#FFD48B"
+    unit = height / (1080 if wide else 1920)
+    small = get_font(round(28 * unit), True)
+    title = get_font(round((60 if wide else 65) * unit), True)
+    caption = get_font(round(27 * unit))
+    edge = round(2 * unit) if on_footage else 0
+    draw.line((x, y, x+round(48*unit), y), fill=accent, width=max(2, round(4*unit)))
+    draw.text((x, y+round(14*unit)), label, fill=accent, font=small, stroke_width=edge, stroke_fill="#102027")
+    text_y = y + round(64*unit)
+    for line in wrap_text(chapter["title"], title, width-2*x, draw)[:2]:
+        draw.text((x, text_y), line, fill="#F5F8F6", font=title, stroke_width=edge, stroke_fill="#102027")
+        text_y += round(79*unit)
+    stamp = chapter.get("published", "")
+    details = f"报道 · {chapter['source']}" + (f"  /  发布 {stamp}" if re.fullmatch(r"\d{4}-\d{2}-\d{2}", stamp) else "")
+    for line in wrap_text(details, caption, width-2*x, draw)[:2]:
+        draw.text((x, text_y+round(11*unit)), line, fill="#CFDEDD", font=caption, stroke_width=edge, stroke_fill="#102027")
+        text_y += round(37*unit)
+    if not on_footage:
+        draw.line((x, round(height*.70), width-x, round(height*.70)), fill="#31444D", width=2)
+    return image
+
+
+def _documentary_plate(scene, width, height, platform, *, video_overlay):
+    """A full-frame image with typography only where the story needs it."""
+    asset = scene.get("asset", {})
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0) if video_overlay else "#12191F")
+    if not video_overlay and asset.get("preview"):
+        with Image.open(asset["preview"]) as picture:
+            image.paste(ImageOps.fit(picture.convert("RGBA"), (width, height)))
+    wide = width > height
+    scale = height / (1080 if wide else 1920)
+    x, y = round(width*.065), round(height*.095)
+    label = ("动画示意" if not asset else asset.get("caption_label") or "本地素材" if asset.get("local") else
+             f"{asset.get('caption_label', '资料画面')}  ·  {asset['author']}")
+    heading = scene.get("documentary_title")
+    number = scene.get("documentary_number")
+    dark = Image.new("RGBA", image.size, "#0A1117")
+    gradient = Image.new("L", (1, height))
+    gradient.putdata([round(max(0, 1-row/(height*.24))*118 + max(0, (row-height*.78)/(height*.22))*142)
+                      for row in range(height)])
+    dark.putalpha(gradient.resize(image.size))
+    image.alpha_composite(dark)
+    draw = ImageDraw.Draw(image)
+    accent = {"xiaohongshu": "#FFD5C8", "douyin": "#FFD48B", "bilibili": "#F5D190"}[platform]
+    ink = "#FFF8ED"
+    credit_font = get_font(max(15, round(23*scale)))
+    if asset.get("caption_label") != "":
+        credit = wrap_text(label, credit_font, width-2*x, draw)[0]
+        draw.text((x, y), credit, font=credit_font, fill=ink, stroke_width=2, stroke_fill="#172027")
+    if scene.get("chapter_handoff"):
+        return _roundup_heading(image, scene["chapter_handoff"], platform, on_footage=True)
+    if heading:
+        title_font = get_font(round((68 if wide else 69)*scale), True)
+        for row, line in enumerate(wrap_text(heading, title_font, round(width*.72), draw)[:2]):
+            draw.text((x, round(height*.30)+row*round(88*scale)), line, font=title_font, fill=ink,
+                      stroke_width=max(2, round(3*scale)), stroke_fill="#192027")
+    elif number:
+        font = get_font(round((112 if wide else 124)*scale), True)
+        draw.text((width-x, round(height*.55)), number, anchor="ra", font=font, fill=accent,
+                  stroke_width=max(2, round(3*scale)), stroke_fill="#172027")
+    return image
+
+
 def generate_episode_slide(case, index, width, height, platform, *, cover=False, video_overlay=False):
     scene = case["scenes"][index]
     layout = "chapter" if cover else scene["layout"]
+    if layout == "roundup_intro":
+        return _roundup_heading(Image.new("RGB", (width, height), "#121E25"),
+                                scene["chapter_handoff"], platform, on_footage=False)
+    if layout in {"footage", "graphic"} or (layout == "opening" and scene.get("asset")):
+        return _documentary_plate(scene, width, height, platform, video_overlay=video_overlay)
+    if layout == "opening":
+        return generate_opening_slide(case, scene, width, height, platform, video_overlay=video_overlay)
     bg, ink, accent, panel = NEWS_PALETTES[platform]
     wide = width > height
     unit = height / (1080 if wide else 1920)
@@ -75,16 +213,6 @@ def generate_episode_slide(case, index, width, height, platform, *, cover=False,
             backdrop = ImageOps.fit(studio.convert("RGB"), (width, height), centering=(.72, .48))
         img = Image.blend(Image.new("RGB", (width, height), "#141314"), backdrop, .47)
         ink, accent = "#F5E9DE", "#EFB275"
-
-    if layout == "footage":
-        if video_overlay:
-            img.paste((0, 0, 0, 0), (0, 0, width, height))
-        elif scene["asset"].get("preview"):
-            with Image.open(scene["asset"]["preview"]) as photo:
-                img.paste(ImageOps.fit(photo, (width, height)))
-        # The lower third sits above the baked subtitle safe area.
-        panel = bg = "#14181B"
-        ink, accent = "#F6F5EF", "#E0EA9A"
 
     draw = ImageDraw.Draw(img)
 
@@ -99,9 +227,9 @@ def generate_episode_slide(case, index, width, height, platform, *, cover=False,
         return y
 
     count = len(case["chapter_starts"])
-    label = "热采  /  今日资讯" if cover or opening else f"今日资讯  /  {scene['chapter']:02d} · {count:02d}"
-    if layout == "footage":
-        draw.rectangle((0, 0, width, top + round(55 * unit)), fill=bg)
+    news = case.get('news') or {}
+    series = news.get('series','今日资讯')
+    label = f"热采  /  {series}" if cover or opening else f"{series}  /  {scene['chapter']:02d} · {count:02d}"
     lines(label, margin, top - round(25 * unit), 30, content, 1, accent, True)
     if layout == "chapter" or opening:
         title = case["title"] if cover or opening else scene["chapter_title"]
@@ -111,7 +239,8 @@ def generate_episode_slide(case, index, width, height, platform, *, cover=False,
         draw.rectangle((margin, y - round(14 * unit), margin + round(width * 0.12), y - round(8 * unit)), fill=accent)
         end = lines(title, margin, y, 88 if wide else 74, content, 3, ink, True)
         direction = (case.get("editorial_plan") or {}).get("throughline")
-        subtitle = direction if opening and direction else (f"{count} 条热点  /  多来源报道" if cover or opening
+        subtitle = direction if opening and direction else ((f"{count} 章  /  所选原文" if news.get('is_reference') else
+                                                            f"{count} 条热点  /  多来源报道") if cover or opening
                                                              else f"来源  /  {scene['chapter_source']}")
         lines(subtitle, margin, min(end + round(42 * unit), round(height * 0.72)), 28, content, 2 if opening else 1, accent)
     elif layout == "closing":
@@ -119,7 +248,7 @@ def generate_episode_slide(case, index, width, height, platform, *, cover=False,
         lines("回看本期", margin, y - round(62 * unit), 34, content, 1, accent, True)
         end = lines(scene["title"], margin, y, 72 if wide else 66, content, 2, ink, True)
         lines(scene["text"], margin, end + round(32 * unit), 39, content, 3, ink)
-        lines(f"共 {count} 章  /  章节内附报道来源", margin, round(height * .73), 27, content, 1, accent)
+        lines(f"共 {count} 章  /  章节内附原文出处", margin, round(height * .73), 27, content, 1, accent)
     elif layout == "metric":
         y = round(height * .23)
         draw.rectangle((margin, y, width - margin, round(height * .69)), fill=panel)
@@ -130,13 +259,6 @@ def generate_episode_slide(case, index, width, height, platform, *, cover=False,
         lines(scene["title"], margin + inset, y + round(234 * unit), 48 if wide else 47,
               content - 2*inset, 2, ink, True)
         lines(f"来源  /  {scene['chapter_source']}", margin, round(height * .73), 25, content, 1, accent)
-    elif layout == "footage":
-        asset = scene["asset"]
-        bar = round(height * (0.67 if wide else 0.59))
-        draw.rectangle((0, bar, width, height), fill=panel)
-        lines(scene["title"], margin, bar + round(25 * unit), 48, content, 1 if wide else 2, ink, True)
-        credit = "本地导入素材" if asset.get("local") else f"示意画面  /  {asset['author']} · {asset['license']}"
-        lines(credit, margin, bar + round((99 if wide else 165) * unit), 25, content, 1, accent)
     else:
         y = round(height * (0.26 if wide else 0.25))
         if layout == "detail":
@@ -153,6 +275,9 @@ def generate_episode_slide(case, index, width, height, platform, *, cover=False,
 
 
 def generate_news_slide(case, index, width, height, platform, *, cover=False, video_overlay=False):
+    if case.get('news_frame') == 'source-news-v1':
+        from core.news_frame import frame_slide
+        return frame_slide(case, index, width, height, platform, video_overlay=video_overlay)
     scene, news = case["scenes"][index], case["news"]
     if scene.get("layout"):
         return generate_episode_slide(case, index, width, height, platform, cover=cover, video_overlay=video_overlay)
@@ -208,199 +333,3 @@ def generate_news_slide(case, index, width, height, platform, *, cover=False, vi
     footer_y = int(height * (0.82 if wide else 0.76))
     text_block("AI 合成配音", margin, footer_y, 23, accent, width - 2 * margin, 1)
     return img
-
-def generate_scene_slide(case: dict, scene_idx: int, width: int, height: int) -> Image.Image:
-    """
-    Renders an individual scene slide frame with modern aesthetic typography,
-    category badges, metric tags, and central card layout.
-    """
-    scene = case["scenes"][scene_idx]
-    is_horiz = width > height
-
-    # Color palette
-    bg_top = (14, 18, 28)
-    bg_bottom = (24, 30, 44)
-    img = create_gradient(width, height, bg_top, bg_bottom)
-    draw = ImageDraw.Draw(img)
-
-    # 1. Top Series Badge
-    badge_text = f"💡 全球奇趣商业怪诞志 · 第 {case.get('id', '01')} 期"
-    badge_font = get_font(28 if not is_horiz else 24, bold=True)
-    badge_bbox = draw.textbbox((0, 0), badge_text, font=badge_font)
-    bw = badge_bbox[2] - badge_bbox[0] + 40
-    bh = badge_bbox[3] - badge_bbox[1] + 20
-    bx = (width - bw) // 2
-    by = 100 if not is_horiz else 50
-    draw.rounded_rectangle([bx, by, bx + bw, by + bh], radius=15, fill=(35, 45, 65), outline=(70, 90, 130), width=2)
-    draw.text((bx + 20, by + 8), badge_text, font=badge_font, fill=(0, 242, 254))
-
-    # 2. Hero Topic Title Banner
-    title_text = case["title"]
-    title_font = get_font(52 if not is_horiz else 46, bold=True)
-    title_bbox = draw.textbbox((0, 0), title_text, font=title_font)
-    tw = title_bbox[2] - title_bbox[0]
-    tx = (width - tw) // 2
-    ty = by + bh + (40 if not is_horiz else 25)
-    # Accent glow behind title
-    draw.text((tx, ty), title_text, font=title_font, fill=(255, 230, 0))
-
-    # 3. Key stats pill
-    stats_text = f"🔥 营收: {case['revenue']}  |  利润率: {case['profit_margin']}"
-    stats_font = get_font(28 if not is_horiz else 24)
-    stats_bbox = draw.textbbox((0, 0), stats_text, font=stats_font)
-    sw = stats_bbox[2] - stats_bbox[0]
-    sx = (width - sw) // 2
-    sy = ty + (70 if not is_horiz else 60)
-    draw.text((sx, sy), stats_text, font=stats_font, fill=(180, 200, 220))
-
-    # 4. Central Information Card
-    card_w = int(width * (0.88 if not is_horiz else 0.72))
-    card_h = int(height * (0.42 if not is_horiz else 0.52))
-    card_x = (width - card_w) // 2
-    card_y = sy + (60 if not is_horiz else 40)
-
-    # Card background with border
-    draw.rounded_rectangle([card_x, card_y, card_x + card_w, card_y + card_h],
-                           radius=24, fill=(20, 26, 40), outline=(55, 75, 110), width=3)
-
-    # Card Step Tag: e.g. "01 / 离谱的起源"
-    stage_text = f"STEP {scene_idx + 1:02d} · {scene['title']}"
-    stage_font = get_font(30 if not is_horiz else 26, bold=True)
-    draw.text((card_x + 50, card_y + 45), stage_text, font=stage_font, fill=(0, 230, 118))
-
-    # Card Focus Headline: scene["card_title"]
-    headline_text = scene.get("card_title", scene["title"])
-    headline_font = get_font(44 if not is_horiz else 38, bold=True)
-    draw.text((card_x + 50, card_y + 105), headline_text, font=headline_font, fill=(255, 255, 255))
-
-    # Divider line
-    div_y = card_y + (180 if not is_horiz else 160)
-    draw.line([(card_x + 50, div_y), (card_x + card_w - 50, div_y)], fill=(50, 65, 95), width=2)
-
-    # Card Description / Bullets
-    desc_text = scene.get("card_desc", scene["text"][:60] + "...")
-    desc_font = get_font(32 if not is_horiz else 28)
-    wrapped_lines = wrap_text(desc_text, desc_font, card_w - 100, draw)
-
-    line_y = div_y + 35
-    for line in wrapped_lines:
-        draw.text((card_x + 50, line_y), f"• {line}", font=desc_font, fill=(220, 230, 245))
-        line_y += (48 if not is_horiz else 42)
-
-    # 5. Visual Accent Tag in bottom-right of card
-    cat_tag = f"#{case.get('category', '商业奇案')}"
-    tag_font = get_font(26 if not is_horiz else 22)
-    t_bbox = draw.textbbox((0, 0), cat_tag, font=tag_font)
-    t_w = t_bbox[2] - t_bbox[0]
-    draw.text((card_x + card_w - t_w - 40, card_y + card_h - 50), cat_tag, font=tag_font, fill=(120, 145, 185))
-
-    return img
-
-def generate_xiaohongshu_cover(case: dict, output_path: str, width: int = 1080, height: int = 1440):
-    """
-    Renders high-CTR Xiaohongshu cover (3:4 ratio) with bold contrasting color blocks,
-    curiosity gap headline, and visual sticker badges.
-    """
-    img = create_gradient(width, height, (18, 20, 30), (30, 35, 52))
-    draw = ImageDraw.Draw(img)
-
-    meta = case["platform_metadata"]["xiaohongshu"]
-
-    # Top sticker pill
-    badge = meta.get("cover_badge", "海外奇葩搞钱 #01")
-    b_font = get_font(34, bold=True)
-    draw.rounded_rectangle([80, 100, 480, 170], radius=18, fill=(255, 36, 66))
-    draw.text((110, 115), f"🔥 {badge}", font=b_font, fill=(255, 255, 255))
-
-    # Main Headline Banner (Big, Yellow / White)
-    main_title = meta.get("cover_main", case["title"])
-    m_font = get_font(72, bold=True)
-    lines = wrap_text(main_title, m_font, width - 160, draw)
-    ty = 240
-    for line in lines:
-        # Yellow background highlight box for key text
-        bbox = draw.textbbox((0, 0), line, font=m_font)
-        lw = bbox[2] - bbox[0]
-        lh = bbox[3] - bbox[1]
-        draw.rounded_rectangle([75, ty - 10, 85 + lw + 20, ty + lh + 15], radius=14, fill=(255, 230, 0))
-        draw.text((85, ty), line, font=m_font, fill=(15, 15, 20))
-        ty += lh + 45
-
-    # Subtitle Pill
-    sub_title = meta.get("cover_sub", f"{case['revenue']} · {case['profit_margin']}暴利")
-    s_font = get_font(38, bold=True)
-    draw.text((85, ty + 20), sub_title, font=s_font, fill=(0, 242, 254))
-
-    # Middle Feature Box
-    box_y = ty + 100
-    box_h = 420
-    draw.rounded_rectangle([70, box_y, width - 70, box_y + box_h], radius=24, fill=(25, 32, 48), outline=(65, 85, 125), width=3)
-
-    # Inside feature bullets
-    f_font = get_font(34, bold=False)
-    bullets = [
-        f"🎯 创始人: {case['founder']} ({case['year']})",
-        f"💰 真实营收: {case['revenue']}",
-        f"📦 成本极低: {case['cost']}",
-        f"💡 底层商业模型: {case['category']}"
-    ]
-    by = box_y + 45
-    for b in bullets:
-        draw.text((110, by), b, font=f_font, fill=(230, 240, 255))
-        by += 80
-
-    # Bottom Callout Sticker
-    bot_text = "👇 点击查看完整商业闭环与搞钱逻辑"
-    bot_font = get_font(34, bold=True)
-    draw.rounded_rectangle([70, height - 160, width - 70, height - 80], radius=20, fill=(0, 230, 118))
-    draw.text((160, height - 140), bot_text, font=bot_font, fill=(10, 20, 15))
-
-    img.save(output_path, quality=95)
-    return output_path
-
-def generate_bilibili_cover(case: dict, output_path: str, width: int = 1920, height: int = 1080):
-    """
-    Renders high-CTR Bilibili 16:9 widescreen thumbnail.
-    """
-    img = create_gradient(width, height, (12, 16, 26), (25, 32, 48))
-    draw = ImageDraw.Draw(img)
-
-    # Left Side: Giant Hook Text
-    badge_font = get_font(36, bold=True)
-    draw.rounded_rectangle([100, 100, 480, 170], radius=18, fill=(0, 161, 214)) # Bilibili cyan
-    draw.text((130, 115), "【商业奇案观察】", font=badge_font, fill=(255, 255, 255))
-
-    title_font = get_font(76, bold=True)
-    title = case["title"]
-    lines = wrap_text(title, title_font, 1000, draw)
-    ty = 230
-    for line in lines:
-        draw.text((100, ty), line, font=title_font, fill=(255, 230, 0))
-        ty += 110
-
-    sub_font = get_font(42)
-    draw.text((100, ty + 20), f"⚡ 创始人: {case['founder']} | 利润率高达 {case['profit_margin']}", font=sub_font, fill=(0, 242, 254))
-
-    # Right Side: Giant Stats Card
-    rx = 1200
-    ry = 180
-    rw = 620
-    rh = 720
-    draw.rounded_rectangle([rx, ry, rx + rw, ry + rh], radius=32, fill=(20, 26, 40), outline=(60, 80, 120), width=4)
-
-    draw.text((rx + 60, ry + 60), "REVENUE 战报", font=get_font(32, bold=True), fill=(0, 230, 118))
-    draw.text((rx + 60, ry + 120), case["revenue"], font=get_font(52, bold=True), fill=(255, 255, 255))
-
-    draw.line([(rx + 60, ry + 220), (rx + rw - 60, ry + 220)], fill=(50, 65, 95), width=2)
-
-    draw.text((rx + 60, ry + 260), "• 商业类别:", font=get_font(34, bold=True), fill=(180, 200, 220))
-    draw.text((rx + 60, ry + 310), f"  {case['category']}", font=get_font(34), fill=(255, 230, 0))
-
-    draw.text((rx + 60, ry + 390), "• 成本分析:", font=get_font(34, bold=True), fill=(180, 200, 220))
-    draw.text((rx + 60, ry + 440), f"  {case['cost']}", font=get_font(32), fill=(255, 255, 255))
-
-    draw.text((rx + 60, ry + 520), "• 核心武器:", font=get_font(34, bold=True), fill=(180, 200, 220))
-    draw.text((rx + 60, ry + 570), f"  {case['scenes'][2]['card_title']}", font=get_font(32), fill=(0, 242, 254))
-
-    img.save(output_path, quality=95)
-    return output_path

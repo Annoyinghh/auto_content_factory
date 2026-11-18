@@ -1,11 +1,15 @@
 (() => {
-  const ticket = /^#acf-post=(\d{1,5})\.([a-f0-9]{64})$/.exec(location.hash);
+  const ticket = /^#acf-post=(\d{1,5})\.([a-f0-9]{64})(&panel=1)?$/.exec(location.hash);
   const bili = location.origin === "https://member.bilibili.com" && /^\/platform\/upload\/video\/frame\/?$/.test(location.pathname);
   const douyin = location.origin === "https://creator.douyin.com" && /^\/creator-micro\/content\/upload\/?$/.test(location.pathname);
-  if (!ticket || !(bili || douyin)) return;
+  const target = new URLSearchParams(location.search).get("target");
+  const xhs = location.origin === "https://creator.xiaohongshu.com" && /^\/publish\/publish\/?$/.test(location.pathname)
+    && (target === "video" || target === "image");
+  const image = xhs && target === "image";
+  if (!ticket || !(bili || douyin || xhs)) return;
   history.replaceState(history.state, "", location.pathname + location.search);
 
-  const send = (action, status) => chrome.runtime.sendMessage({ action, status, port: Number(ticket[1]), token: ticket[2] });
+  const send = (action, status, index) => chrome.runtime.sendMessage({ action, status, index, port: Number(ticket[1]), token: ticket[2] });
   const notify = (message) => {
     const note = document.createElement("div");
     note.setAttribute("role", "status");
@@ -21,7 +25,7 @@
 
   const visible = (node) => node && node.getClientRects().length > 0 && getComputedStyle(node).visibility === "visible";
   const editors = 'input:not([type]),input[type="text"],textarea,[contenteditable="true"],[contenteditable="plaintext-only"]';
-  const titleName = /^(?:(?:请输入|添加|填写)\s*)?(?:(?:作品|视频|稿件|短)\s*)?标题(?:[\s（(].*|[：:]|\.{3}|…)?$/;
+  const titleName = /^(?:(?:请输入|添加|填写)\s*)?(?:(?:作品|视频|稿件|短|笔记)\s*)?标题(?:[\s（(].*|[：:]|\.{3}|…)?$/;
   const bodyName = /^(?:(?:请输入|请填写|填写|添加)\s*)?(?:(?:作品|视频|稿件)\s*)?(?:简介|描述|文案)(?:[\s，,（(].*|[：:]|\.{3}|…)?$/;
   const names = (field) => [
     field.getAttribute("placeholder"), field.getAttribute("aria-label"), field.getAttribute("data-placeholder"),
@@ -31,11 +35,21 @@
   ];
 
   function findField(pattern, description = false) {
-    const match = (text) => pattern.test((text || "").trim().replace(/^[*＊]\s*/, ""));
+    const match = (text) => {
+      const name = (text || "").trim().replace(/^[*＊]\s*/, "");
+      return pattern.test(name) || (xhs && (description
+        ? /^(?:请)?(?:输入|填写|添加)?(?:笔记正文|正文|笔记内容)(?:[\s，,（(：:…].*)?$/.test(name)
+        : /^填写标题会有更多赞/.test(name)));
+    };
     const fields = [...document.querySelectorAll(editors)].filter(node => visible(node) && !node.disabled && !node.readOnly &&
       (!description || node.tagName !== "INPUT"));
     const direct = fields.filter(node => names(node).some(match));
     if (direct.length) return direct.length === 1 ? direct[0] : null;
+    if (xhs && description) {
+      const note = fields.filter(node => node.id === "post-textarea" ||
+        node.isContentEditable && node.closest("#post-textarea"));
+      if (note.length) return note.length === 1 ? note[0] : null;
+    }
     const nearby = fields.filter(node => {
       for (let wrap = node.parentElement, i = 0; wrap && i < 4; wrap = wrap.parentElement, i++) {
         if (wrap.querySelectorAll(editors).length !== 1) break;
@@ -52,6 +66,7 @@
     const selector = bili ? '.upload-wrp .bcc-upload-wrapper input[type="file"]' : 'input[type="file"]';
     const candidates = [...document.querySelectorAll(selector)].filter(input => {
       if (input.disabled || input.files.length) return false;
+      if (image) return /(?:image\/|\.jpe?g\b|\.png\b|\.webp\b)/i.test(input.accept);
       if (/(?:video\/|\.mp4\b|\.mov\b)/i.test(input.accept)) return true;
       return !bili && !input.accept && /上传视频/.test(input.parentElement?.innerText || "");
     });
@@ -105,13 +120,17 @@
   (async () => {
     const { job } = await send("job") || {};
     if (!job) return notify("无法连接桌面程序，请从 EXE 重新发起。");
-    const input = await waitFor(uploadField, 14000);
-    if (!input) return finish("no_form", "没找到空白的视频上传区。请先登录，或在当前页面手动处理。");
-    const { blob } = await send("video") || {};
-    if (!(blob instanceof Blob) || !blob.size) return finish("transfer_error", "未能接收视频。请更新浏览器或改用手动投稿。");
-    if (uploadField() !== input) return finish("no_form", "上传区已改变，请检查当前页面。");
+    const assets = image ? job.images : [{ name: job.filename, type: "video/mp4" }];
+    if (!Array.isArray(assets) || !assets.length) return finish("transfer_error", "没有收到可投稿的素材。");
+    const input = await waitFor(uploadField, ticket[3] ? 600000 : 14000);
+    if (!input || (assets.length > 1 && !input.multiple)) return finish("no_form", "没找到可接收这份素材的空白上传区。");
     const files = new DataTransfer();
-    files.items.add(new File([blob], job.filename, { type: "video/mp4" }));
+    for (const [index, asset] of assets.entries()) {
+      const { blob } = await send(image ? "asset" : "video", undefined, index) || {};
+      if (!(blob instanceof Blob) || !blob.size) return finish("transfer_error", "未能接收完整素材，请在工作台重试。");
+      files.items.add(new File([blob], asset.name, { type: asset.type }));
+    }
+    if (uploadField() !== input) return finish("no_form", "上传区已改变，请检查当前页面。");
     input.files = files.files;
     dispatched = true;
     input.dispatchEvent(new Event("change", { bubbles: true }));
@@ -122,12 +141,12 @@
       body = findField(bodyName, true);
       return title && body;
     }, 45000);
-    const titleFilled = fill(title, job.title, [job.filename, job.filename.replace(/\.mp4$/i, "")]);
+    const titleFilled = fill(title, job.title, image ? [] : [job.filename, job.filename.replace(/\.mp4$/i, "")]);
     const bodyFilled = fill(body, job.body);
     if (titleFilled && bodyFilled) {
-      return finish("ready", "标题和文案已填写。请检查视频上传进度，审稿后自行发布。");
+      return finish("ready", "标题和文案已填写。请检查素材上传进度，审稿后自行发布。");
     }
-    return finish("partial", "视频已交给投稿页。请补填未完成的标题或文案，并检查上传进度。");
+    return finish("partial", "素材已交给投稿页。请补填未完成的标题或文案，并检查上传进度。");
   })().catch(() => finish(dispatched ? "needs_check" : "transfer_error", dispatched
     ? "请检查当前投稿页，确认上传和填写情况。" : "无法准备投稿，请从 EXE 重试或手动处理。"));
 })();

@@ -4,6 +4,46 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from core.editing import validate_cut
 from core.episodes import MOTIONS
+from studio_theme import FONT, LINE, MUTED, SURFACE, TEXT
+
+
+class StoryboardTimeline(tk.Canvas):
+    """Read the order of the real draft and open its corresponding editor scene."""
+
+    def __init__(self, parent, scenes, seconds, open_scene=None):
+        super().__init__(parent, height=99, background=SURFACE, highlightthickness=1,
+                         highlightbackground=LINE, borderwidth=0)
+        self.scenes, self.seconds, self.open_scene = scenes, seconds, open_scene
+        self.bind("<Configure>", self.draw)
+
+    def draw(self, event):
+        self.delete("all")
+        weights = [max(1, len(scene["text"])) for scene in self.scenes]
+        total = sum(weights)
+        start, end = 48, max(50, event.width - 12)
+        elapsed = 0
+        colors = ("#e0e6ff", "#eaeaf4", "#f7e4d8")
+        labels = ("画面", "口播", "字幕")
+        self.create_text(start, 13, text="00:00", fill=MUTED, anchor="w", font=(FONT, 8))
+        self.create_text(end, 13, text=f"约 {self.seconds // 60:02d}:{self.seconds % 60:02d}",
+                         fill=MUTED, anchor="e", font=(FONT, 8))
+        for row, label in enumerate(labels):
+            self.create_text(8, 36 + 23 * row, text=label, fill=MUTED, anchor="w", font=(FONT, 9))
+        for index, (scene, weight) in enumerate(zip(self.scenes, weights)):
+            left = start + (end - start) * elapsed / total
+            elapsed += weight
+            right = start + (end - start) * elapsed / total
+            tag = f"scene{index}"
+            if right - left < 2:
+                continue
+            for row, color in enumerate(colors):
+                top = 26 + 23 * row
+                self.create_rectangle(left, top, right - 1, top + 19, fill=color, outline="", tags=(tag,))
+            if right - left >= 27:
+                text = scene["title"][:max(1, int((right - left - 10) / 12))]
+                self.create_text(left + 4, 36, text=text, fill=TEXT, anchor="w", font=(FONT, 8), tags=(tag,))
+            if self.open_scene:
+                self.tag_bind(tag, "<Button-1>", lambda _event, i=index: self.open_scene(i))
 
 
 class CutEditor:
@@ -84,7 +124,11 @@ class CutEditor:
             motion = ttk.Combobox(effects, state="readonly", width=13, values=("自动", *MOTIONS.values()))
             motion.set(MOTIONS.get(scene.get("motion"), "自动"))
             motion.pack(side="left", padx=6)
-        self.rows.append((panel, title, text, media, zoom, motion))
+        if visual := scene.get("visual"):
+            position = f" · 素材入点 {visual['start']:.2f} 秒" if scene["media"] else ""
+            ttk.Label(panel, text=f"{visual['intent']} · {visual['reason']}{position}", wraplength=560,
+                      style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
+        self.rows.append((panel, title, text, media, zoom, motion, scene))
 
     def refresh_scenes(self):
         selected = self.tabs.select()
@@ -115,11 +159,14 @@ class CutEditor:
     def submit(self):
         motion_codes = {label: code for code, label in MOTIONS.items()}
         scenes = []
-        for _, title, text, media, zoom, motion in self.rows:
+        for _, title, text, media, zoom, motion, original in self.rows:
             scene = {"title": title.get().strip(), "text": text.get("1.0", "end-1c").strip(),
                      "media": self.assets[media.get()], "zoom": zoom.get()}
             if motion and (code := motion_codes.get(motion.get())):
                 scene["motion"] = code
+            if original.get("visual") and all(scene.get(key) == original.get(key)
+                                               for key in ("text", "media", "motion", "zoom")):
+                scene["visual"] = original["visual"]
             scenes.append(scene)
         if any(not 1 <= len(scene["title"]) <= 36 or not 1 <= len(scene["text"]) <= 280 for scene in scenes):
             messagebox.showerror("草稿未保存", "分镜标题需为 1–36 字，口播需为 1–280 字。", parent=self.window)

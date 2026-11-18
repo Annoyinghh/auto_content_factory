@@ -8,6 +8,7 @@ from pathlib import Path
 from tkinter import ttk
 
 from core.accounts import account_hint
+from core.browser_post import BROWSER_POST_PLATFORMS
 from core.daily_news import story_key
 from core.intake import has_report, match_hotspots
 from core.workflow import edition_path, release_directory
@@ -51,9 +52,18 @@ def _day_label(day):
     return f"{day.month} 月 {day.day} 日  ·  星期{weekday}"
 
 
+def prepare_intake_view(snapshot):
+    matched = match_hotspots(snapshot)
+    if snapshot.get("checked") and not any(row.get("article") for rows in matched.values() for row in rows):
+        checked = dt.datetime.fromtimestamp(snapshot["checked"], dt.timezone.utc)
+        matched = match_hotspots(snapshot, checked)
+    return snapshot, matched
+
+
 class IntakeDesk:
-    def __init__(self, collection, trends, names, start_editorial):
+    def __init__(self, collection, trends, names, start_editorial, open_writing):
         self.snapshot = {"articles": [], "ranks": {}, "checked": None, "errors": []}
+        self.matched = {}
         self.article_links = {}
         self.platform = "douyin"
         self.query = ""
@@ -63,20 +73,20 @@ class IntakeDesk:
         self.use_article = ttk.Button(header, text="用此选题创作", style="Accent.TButton", state="disabled",
                                       command=lambda: start_editorial({"kind": "article", "id": self.articles.selection()[0]}))
         self.use_article.pack(side="right")
-        self.collection_date = ttk.Label(collection, style="Muted.TLabel")
+        self.collection_date = ttk.Label(collection, text="正在读取本地采集库…", style="Muted.TLabel")
         self.collection_date.pack(anchor="w", pady=(4, 17))
         tk.Frame(collection, height=1, background=LINE).pack(fill="x")
         self.articles = _table(collection, [("title", "", 450, True), ("source", "", 130, False),
                                             ("published", "", 68, False)], headings=False)
         self.articles.column("published", anchor="center")
         self.articles.tag_configure("older", background=PAGE, foreground=MUTED, font=(FONT, 9, "bold"))
-        self.articles.tag_configure("alternate", background="#101b25")
+        self.articles.tag_configure("alternate", background="#eeeff6")
         self.articles.bind("<Double-1>", lambda event: self.open_article())
         self.articles.bind("<Return>", lambda event: self.open_article())
         self.articles.bind("<<TreeviewSelect>>", lambda event: self.use_article.configure(
             state="normal" if self.articles.selection() and self.articles.selection()[0] in self.article_links else "disabled"))
 
-        heading(trends, "平台热点", "选择一个热点，在 AI 创作里挑选相关报道。")
+        heading(trends, "平台热点", "选一个热点，再展开相关报道、补充素材和指定讲述重点。")
         self.trend_status = ttk.Label(trends, style="Muted.TLabel", wraplength=700)
         self.trend_status.pack(anchor="w", pady=(4, 15))
         controls = ttk.Frame(trends)
@@ -90,6 +100,12 @@ class IntakeDesk:
                                   command=lambda: start_editorial({"kind": "hotspot", "platform": self.platform,
                                                                    "title": self.selected_topics()[0]}))
         self.produce.pack(side="right")
+        self.note_count = ttk.Combobox(controls, values=("2 版", "3 版"), state="readonly", width=5)
+        self.note_count.current(0)
+        self.write = ttk.Button(controls, text="用热点写文案", state="disabled",
+                                command=lambda: open_writing(self.platform, self.selected_topics()[0],
+                                    int(self.note_count.get()[0]) if self.platform == "xiaohongshu" else None))
+        self.write.pack(side="right", padx=(0, 8))
         ttk.Button(controls, text="榜单来源", command=self.open_board).pack(side="right", padx=(0, 8))
         self.trends = _table(trends, [("rank", "榜单排名", 76, False), ("title", "热点", 430, True),
                                      ("heat", "热度", 86, False), ("article", "报道匹配", 122, False)])
@@ -97,15 +113,9 @@ class IntakeDesk:
         self.trends.bind("<Double-1>", lambda event: self.open_hotspot())
         self.trends.bind("<Return>", lambda event: self.open_hotspot())
 
-    def update(self, snapshot):
+    def update(self, snapshot, matched):
         self.snapshot = snapshot
-        live_matched = match_hotspots(snapshot)
-        has_live = any(row.get("article") for rows in live_matched.values() for row in rows)
-        if not has_live and snapshot.get("checked"):
-            checked_dt = dt.datetime.fromtimestamp(snapshot["checked"], dt.timezone.utc)
-            self.matched = match_hotspots(snapshot, checked_dt)
-        else:
-            self.matched = live_matched
+        self.matched = matched
         today = dt.date.today()
         self.collection_date.configure(text=_day_label(today))
         rows = []
@@ -153,6 +163,13 @@ class IntakeDesk:
     def update_selection(self):
         count = len(self.trends.selection())
         self.produce.configure(state="normal" if count == 1 else "disabled")
+        self.write.configure(state="normal" if count == 1 else "disabled",
+                             text="写小红书文案" if self.platform == "xiaohongshu" else "用热点写文案")
+        if self.platform == "xiaohongshu":
+            if not self.note_count.winfo_manager():
+                self.note_count.pack(side="right", padx=(0, 6), before=self.write)
+        else:
+            self.note_count.pack_forget()
 
     def open_article(self):
         selected = self.articles.selection()
@@ -169,15 +186,18 @@ class IntakeDesk:
 
 
 class ReleaseDesk:
-    def __init__(self, parent, names, publishers, account_settings, reload, hold, submit, on_day):
+    def __init__(self, parent, names, publishers, account_settings, reload, hold, submit, browser_post, on_day,
+                 share_review):
         self.names = names
         self.publishers = publishers
         self.rows = {}
+        self.previous_review = None
+        self.douyin_profiles = {}
         self.hold = hold
         self.on_day = on_day
-        title = heading(parent, "发布中心", "预览成片、暂缓不满意的版本，并提交通过检查的作品。")
-        self.submit = ttk.Button(title, text="一键发布", style="Accent.TButton", command=submit)
-        self.submit.pack(side="right")
+        title = heading(parent, "发布中心", "选中已审成片，打开投稿页并上传。请在投稿页核对账号、成片和文案后发布。")
+        self.fill = ttk.Button(title, text="填入投稿页", style="Accent.TButton", command=browser_post, state="disabled")
+        self.fill.pack(side="right")
         frame, week = panel(parent, padding=(12, 9))
         frame.pack(fill="x", pady=(0, 12))
         ttk.Label(week, text="本周成片", style="PanelTitle.TLabel").pack(anchor="w", pady=(0, 7))
@@ -191,14 +211,33 @@ class ReleaseDesk:
             self.days.append(button)
         buttons = ttk.Frame(parent)
         buttons.pack(fill="x")
-        self.play = ttk.Button(buttons, text="播放成片", command=self.play_selected)
+        self.summary = ttk.Label(buttons, style="Muted.TLabel")
+        self.summary.pack(side="left")
+        self.submit = ttk.Button(buttons, text="开放平台投稿", command=submit)
+        self.submit.pack(side="right")
+        ttk.Button(buttons, text="账号与作品", command=account_settings).pack(side="right", padx=(0, 6))
+        ttk.Button(buttons, text="刷新队列", command=reload).pack(side="right", padx=(0, 6))
+        selection = ttk.Frame(parent)
+        selection.pack(fill="x", pady=(8, 0))
+        self.play = ttk.Button(selection, text="播放成片", command=self.play_selected)
         self.play.pack(side="left")
-        self.flag = ttk.Button(buttons, text="暂缓这版", command=self.flag_selected)
-        self.flag.pack(side="left", padx=8)
-        ttk.Button(buttons, text="账号与作品", command=account_settings).pack(side="left")
-        ttk.Button(buttons, text="刷新队列", command=reload).pack(side="left", padx=8)
-        self.summary = ttk.Label(parent, style="Muted.TLabel", wraplength=760)
-        self.summary.pack(anchor="w", pady=(8, 0))
+        self.flag = ttk.Button(selection, text="暂缓这版", command=self.flag_selected)
+        self.flag.pack(side="left", padx=6)
+        self.share = ttk.Button(selection, text="送团队审片", command=share_review, state="disabled")
+        self.share.pack(side="left")
+        self.douyin_account = ttk.Combobox(selection, width=15, state="readonly")
+        self.douyin_account.pack(side="right")
+        ttk.Label(selection, text="抖音投稿账号", style="Muted.TLabel").pack(side="right", padx=(6, 8))
+        self.douyin_account.bind("<<ComboboxSelected>>", self.choose_douyin_account)
+        self.review_link = ttk.Frame(parent)
+        self.review_hint = ttk.Label(self.review_link, style="Muted.TLabel", wraplength=440)
+        self.review_hint.pack(side="left", fill="x", expand=True)
+        ttk.Button(self.review_link, text="取消关联", command=lambda: self.set_review_base(None)).pack(side="right")
+        self.operations_link = ttk.Frame(parent)
+        self.operations_hint = ttk.Label(self.operations_link, style="Muted.TLabel", wraplength=460)
+        self.operations_hint.pack(side="left", fill="x", expand=True)
+        self.unlink_operations = ttk.Button(self.operations_link, text="解除投稿任务")
+        self.unlink_operations.pack(side="right")
         self.tree = _table(parent, [("platform", "平台", 82, False), ("title", "成片", 350, True),
                                     ("account", "投稿账号", 145, False), ("state", "发布状态", 144, False)])
         self.tree.bind("<<TreeviewSelect>>", lambda event: self.select())
@@ -229,35 +268,99 @@ class ReleaseDesk:
             receipt = (directory / "submitted.txt").is_file()
             uncertain = (directory / "submitting.txt").exists()
             held = bool(video and item.get("held_video") == video)
-            editable = bool(video and Path(video).is_file() and not receipt and not uncertain)
+            available = bool(video and Path(video).is_file())
+            editable = available and not receipt and not uncertain
+            current = item.get("edit_revision") == item.get("package_revision")
+            browser_ready = editable and current and not held and platform in BROWSER_POST_PLATFORMS
             if receipt:
                 state = "已提交审核"
             elif uncertain:
                 state = "待核对 · 不重发"
-            elif not video or not Path(video).is_file():
+            elif not available:
                 state = "无可用成片"
-            elif item.get("edit_revision") != item.get("package_revision"):
+            elif not current:
                 state = "草稿已更新"
             elif held:
                 state = "已暂缓"
             elif platform not in self.publishers:
-                state = "暂无直连接口"
+                state = "创作者后台投稿"
             elif not identity:
-                state = "需要开放平台授权"
+                state = "可填稿"
             else:
                 state = "可发布"
             self.rows[platform] = {"title": package.get("title", item.get("story", {}).get("title", "—")),
-                                   "account": account, "identity": identity, "video": video, "state": state,
-                                   "editable": editable, "held": held}
-        _replace_rows(self.tree, ((key, (self.names[key], row["title"], row["account"], row["state"]))
+                                   "account": account if identity else ("工作台内登录" if platform == "douyin" else "浏览器登录账号"),
+                                   "identity": identity, "video": video, "state": state,
+                                   "editable": editable, "held": held, "browser_ready": browser_ready,
+                                   "review_ready": available and current and not held}
+        douyin_label = self.douyin_account.get() or "请选择抖音账号"
+        _replace_rows(self.tree, ((key, (self.names[key], row["title"],
+                                       douyin_label if key == "douyin" else row["account"], row["state"]))
                                   for key, row in self.rows.items()))
         count = len(self.eligible())
-        self.summary.configure(text=f"{day}  ·  {count} 条可发布  ·  平台收到投稿后进入审核")
-        self.submit.configure(text=f"一键发布（{count}）", state="normal" if count and not busy else "disabled")
+        fillable = sum(row["browser_ready"] for row in self.rows.values())
+        self.summary.configure(text=f"{day}  ·  {fillable} 条可填稿")
+        self.submit.configure(text=f"开放平台投稿（{count}）", state="normal" if count and not busy else "disabled")
         self.select()
 
     def eligible(self):
         return {key: row for key, row in self.rows.items() if row["state"] == "可发布"}
+
+    def set_douyin_profiles(self, profiles):
+        selected = self.selected_douyin_profile() if len(self.douyin_profiles) > 1 else None
+        self.douyin_profiles = {label: key for key, label in profiles.items()}
+        self.douyin_account.configure(values=list(self.douyin_profiles))
+        self.douyin_account.set(profiles.get(selected, next(iter(profiles.values())) if len(profiles) == 1 else ""))
+
+    def selected_douyin_profile(self):
+        return self.douyin_profiles.get(self.douyin_account.get())
+
+    def choose_douyin_account(self, _event=None):
+        if self.tree.exists("douyin"):
+            self.tree.set("douyin", "account", self.douyin_account.get())
+        self.select()
+
+    def selected_browser_post(self):
+        selected = self.tree.selection()
+        if not self.busy and selected:
+            key = selected[0]
+            row = self.rows.get(key, {})
+            if row.get("browser_ready") and (key != "douyin" or self.selected_douyin_profile()):
+                return key, row["video"]
+        return None
+
+    def selected_team_review(self):
+        if self.busy:
+            return None
+        selected = next(iter(self.tree.selection()), None)
+        if self.previous_review and selected != self.previous_review["platform"]:
+            return None
+        row = self.rows.get(selected, {})
+        return (selected, row["video"]) if row.get("review_ready") else None
+
+    def set_review_base(self, review):
+        self.previous_review = review
+        if review:
+            platform = self.names.get(review["platform"], review["platform"])
+            title = review["title"]
+            title = title if len(title) <= 28 else title[:28] + "…"
+            self.review_hint.configure(text=f"续审《{title}》  ·  请选择 {platform} 的新版成片")
+            self.review_link.pack(before=self.tree.master, fill="x", pady=(8, 0))
+        else:
+            self.review_link.pack_forget()
+        self.share.configure(text="送新版审片" if review else "送团队审片")
+        self.select()
+
+    def set_operations_task(self, publication, clear=None):
+        if not publication:
+            self.operations_link.pack_forget()
+            return
+        title = publication["title"]
+        title = title if len(title) <= 25 else title[:25] + "…"
+        account = publication["account_label"]
+        self.operations_hint.configure(text=f"团队投稿《{title}》  ·  账号 {account}")
+        self.unlink_operations.configure(command=clear)
+        self.operations_link.pack(before=self.tree.master, fill="x", pady=(8, 0))
 
     def select(self):
         selected = self.tree.selection()
@@ -265,6 +368,11 @@ class ReleaseDesk:
         self.play.configure(state="normal" if row.get("video") and Path(row["video"]).is_file() else "disabled")
         self.flag.configure(text="恢复发布资格" if row.get("held") else "暂缓这版",
                             state="normal" if row.get("editable") and not self.busy else "disabled")
+        self.share.configure(state="normal" if self.selected_team_review() else "disabled")
+        self.fill.configure(
+            text="在工作台投稿" if selected and selected[0] == "douyin" else "填入投稿页",
+            state="normal" if self.selected_browser_post() else "disabled",
+        )
 
     def play_selected(self):
         if selected := self.tree.selection():

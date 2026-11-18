@@ -1,0 +1,22 @@
+[Unit]
+Description=Auto Content Factory team review
+After=network.target
+
+[Service]
+User=acf-team
+Group=acf-team
+WorkingDirectory=/opt/auto-content-factory
+StateDirectory=acf-team
+StateDirectoryMode=0700
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/auto-content-factory/.venv/bin/python -m core.team_service --data /var/lib/acf-team serve --port 8765
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

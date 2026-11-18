@@ -23,6 +23,19 @@ def draw_waveform(video):
     return waveform.name if waveform.is_file() else None
 
 
+def capture_frame(video, poster, seconds):
+    if not video.is_file():
+        return False
+    try:
+        subprocess.run([get_ffmpeg(), "-loglevel", "error", "-nostdin", "-y", "-ss", f"{seconds:.3f}",
+                        "-i", str(video), "-frames:v", "1", "-vf", "scale=640:640:force_original_aspect_ratio=decrease",
+                        "-q:v", "3", str(poster)], check=True, capture_output=True, timeout=12,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        poster.unlink(missing_ok=True)
+    return poster.is_file()
+
+
 def build_pages(case, audio_info, video):
     scenes = case["scenes"]
     durations = audio_info["scene_durations"]
@@ -45,20 +58,13 @@ def build_pages(case, audio_info, video):
             break
         narration = " ".join(str(shot.get("text", "")).strip() for shot in scenes[start:end]).strip()
         poster = video.with_name(f"reading-{index:02d}.jpg")
-        if video.is_file():
-            try:
-                subprocess.run([get_ffmpeg(), "-loglevel", "error", "-nostdin", "-y", "-ss", f"{seconds:.3f}",
-                                "-i", str(video), "-frames:v", "1", "-vf", "scale=640:640:force_original_aspect_ratio=decrease",
-                                "-q:v", "3", str(poster)], check=True, capture_output=True, timeout=12,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            except (OSError, subprocess.SubprocessError):
-                poster.unlink(missing_ok=True)
+        has_frame = capture_frame(video, poster, seconds)
         related = news.get("chapter_sources", {}).get(title, [])
         source = related[0] if related else sources.get(title, {})
         pages.append({"title": title, "start_ms": round(seconds * 1000),
                       "excerpt": narration[:320] + ("…" if len(narration) > 320 else ""),
                       "source": source.get("source", news.get("source", "")),
                       "source_url": source.get("url", news.get("source_url", "")),
-                      "frame": poster.name if poster.is_file() else None,
+                      "frame": poster.name if has_frame else None,
                       **({"sources": related} if related else {})})
     return pages

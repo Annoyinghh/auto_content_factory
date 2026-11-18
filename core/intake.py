@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import re
 import sqlite3
+from collections import defaultdict
 from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -68,6 +69,8 @@ def _connect(output_dir):
     with db:
         db.execute("CREATE TABLE IF NOT EXISTS articles (id TEXT PRIMARY KEY, collected REAL, story TEXT)")
         db.execute("CREATE TABLE IF NOT EXISTS ranks (platform TEXT PRIMARY KEY, snapshot TEXT, error TEXT)")
+        db.execute("CREATE TABLE IF NOT EXISTS rank_observations (day TEXT, platform TEXT, id TEXT, "
+                   "PRIMARY KEY(day, platform, id)) WITHOUT ROWID")
         db.execute("CREATE TABLE IF NOT EXISTS intake_state (id INTEGER PRIMARY KEY, checked REAL, errors TEXT)")
         db.execute("CREATE TABLE IF NOT EXISTS topic_search (id TEXT PRIMARY KEY, checked REAL)")
     return db
@@ -75,16 +78,29 @@ def _connect(output_dir):
 
 def read_intake(output_dir, now=None):
     now = now or dt.datetime.now().astimezone()
+    day = now.astimezone().date()
+    today = {"date": day.isoformat(), "articles": [], "rank_counts": {}}
     if not (Path(output_dir) / "collection.sqlite3").is_file():
-        return {"articles": [], "ranks": {}, "checked": None, "errors": []}
+        return {"articles": [], "ranks": {}, "checked": None, "errors": [], "today": today}
     cutoff = (now - dt.timedelta(days=RETENTION_DAYS)).timestamp()
+    start = dt.datetime.combine(day, dt.time.min).timestamp()
+    end = dt.datetime.combine(day + dt.timedelta(days=1), dt.time.min).timestamp()
+    articles = []
     with closing(_connect(output_dir)) as db:
-        articles = [json.loads(row[0]) for row in db.execute("SELECT story FROM articles WHERE collected >= ?", (cutoff,))]
+        for collected, data in db.execute("SELECT collected, story FROM articles WHERE collected >= ?", (cutoff,)):
+            story = json.loads(data)
+            articles.append(story)
+            if start <= collected < end:
+                today["articles"].append({**story, "collected_at": collected,
+                                          "category": story.get("category") or category_for_story(story)})
         ranks = {platform: {**(json.loads(data) if data else {}), "error": error}
                  for platform, data, error in db.execute("SELECT platform, snapshot, error FROM ranks")}
+        today["rank_counts"] = dict(db.execute("SELECT platform, COUNT(*) FROM rank_observations "
+                                                "WHERE day=? GROUP BY platform", (today["date"],)))
         checked, errors = db.execute("SELECT checked, errors FROM intake_state WHERE id = 1").fetchone() or (None, "[]")
+    today["articles"].sort(key=lambda story: story["collected_at"], reverse=True)
     return {"articles": sorted(articles, key=lambda row: row["published"], reverse=True), "ranks": ranks,
-            "checked": checked, "errors": json.loads(errors)}
+            "checked": checked, "errors": json.loads(errors), "today": today}
 
 
 def refresh_intake(output_dir, now):
@@ -99,21 +115,36 @@ def refresh_intake(output_dir, now):
         changes = {}
         for platform, result in ranks.items():
             try:
-                changes[platform] = (json.dumps(result.result(), ensure_ascii=False), "")
+                changes[platform] = (result.result(), "")
             except (ValueError, requests.RequestException) as error:
                 changes[platform] = (None, f"榜单更新失败（{type(error).__name__}）")
 
+    day = now.astimezone().date()
     cutoff = (now - dt.timedelta(days=RETENTION_DAYS)).timestamp()
     with closing(_connect(output_dir)) as db, db:
         db.execute("DELETE FROM articles WHERE collected < ?", (cutoff,))
         db.execute("DELETE FROM topic_search WHERE checked < ?", (cutoff,))
-        db.executemany("INSERT OR IGNORE INTO articles VALUES (?, ?, ?)",
+        # Upgrade legacy copies of the same RSS excerpt without replacing a read article.
+        db.executemany("INSERT INTO articles VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET story="
+                       "json_set(articles.story, '$.content_origin', 'feed', '$.summary_truncated', "
+                       "json_extract(excluded.story, '$.summary_truncated')) "
+                       "WHERE json_extract(excluded.story, '$.content_origin') = 'feed' AND "
+                       "json_extract(articles.story, '$.content_origin') IS NULL AND "
+                       "json_extract(articles.story, '$.url') = json_extract(excluded.story, '$.url') AND "
+                       "json_extract(articles.story, '$.summary') = json_extract(excluded.story, '$.summary')",
                        ((story_key(story), now.timestamp(), json.dumps(story, ensure_ascii=False)) for story in stories))
         db.executemany(
             "INSERT INTO ranks VALUES (?, ?, ?) ON CONFLICT(platform) DO UPDATE SET "
-            "snapshot=COALESCE(excluded.snapshot, ranks.snapshot), error=excluded.error",
-            ((platform, *values) for platform, values in changes.items()),
+            "snapshot=CASE WHEN ranks.snapshot IS NULL OR "
+            "json_extract(excluded.snapshot, '$.published') >= json_extract(ranks.snapshot, '$.published') "
+            "THEN excluded.snapshot ELSE ranks.snapshot END, error=excluded.error",
+            ((platform, json.dumps(board, ensure_ascii=False) if board is not None else None, error)
+             for platform, (board, error) in changes.items()),
         )
+        db.execute("DELETE FROM rank_observations WHERE day < ?", ((day - dt.timedelta(days=RETENTION_DAYS)).isoformat(),))
+        db.executemany("INSERT OR IGNORE INTO rank_observations VALUES (?, ?, ?)",
+                       ((day.isoformat(), platform, story_key(entry)) for platform, (board, _) in changes.items()
+                        if board is not None for entry in board.get("entries", ())))
         db.execute("UPDATE ranks SET snapshot=NULL WHERE json_extract(snapshot, '$.published') < ?", (cutoff,))
         db.execute("INSERT OR REPLACE INTO intake_state VALUES (1, ?, ?)", (now.timestamp(), json.dumps(errors)))
     return read_intake(output_dir, now)
@@ -122,7 +153,9 @@ def refresh_intake(output_dir, now):
 def _signature(text):
     text = re.sub(r"(?<=[A-Za-z0-9])\s*(?:对战|对阵|迎战|vs\.?)\s*(?=[A-Za-z0-9])", "vs", text, flags=re.I)
     compact = re.sub(r"[\W_]+", "", text.casefold())
-    return compact, {compact[i:i + 3] for i in range(len(compact) - 2)}
+    terms = {compact[i:i + 3] for i in range(len(compact) - 2)}
+    pairs = {compact[i:i + 2] for i in range(len(compact) - 1)}
+    return compact, terms, pairs
 
 
 def _anchors(title):
@@ -139,43 +172,69 @@ def _anchors(title):
 
 
 def has_report(story):
-    return bool(story and not story.get("headline_only") and len(story.get("summary", "")) >= MIN_REPORT_LENGTH)
+    note = bool(story and story.get('source_platform') == 'xiaohongshu'
+                and story.get('content_type') == 'photo_note' and story.get('source_type') == 'reference'
+                and re.fullmatch(r'[a-f0-9]{24}', str(story.get('source_note_id', ''))))
+    minimum = 20 if note else MIN_REPORT_LENGTH
+    if story and story.get('content_origin') == 'article' and story.get('content_type') == 'video_article':
+        from core.source_media import candidates
+        if any(row['kind'] == 'video' for row in candidates(story)):
+            minimum = 60
+    return bool(story and story.get('content_origin') != 'feed' and not story.get("headline_only")
+                and len(story.get("summary", "")) >= minimum)
 
 
-def _match_score(name, terms, anchors, headline, tokens):
+def _match_score(topic, anchors, article):
+    name, terms, pairs = topic
+    headline, tokens, headline_pairs = article
     if not headline:
         return 0
-    common = len(terms & tokens)
     if name in headline or (len(headline) >= 4 and headline in name):
         return 2
     if 6 <= len(name) <= 12 and re.search(re.escape(name[:4]) + r".{0,14}" + re.escape(name[-2:]), headline):
         return 1.75
+    common = len(terms & tokens)
     if common >= 3 and common / len(terms) >= 0.5:
         return 1 + common / len(terms)
     if common and len(name) >= 10:
-        pairs = {name[i:i + 2] for i in range(len(name) - 1)}
-        shared = sum(pair in headline for pair in pairs)
+        shared = len(pairs & headline_pairs)
         if shared >= 5 and shared / len(pairs) >= 0.4:
             return 1 + shared / len(pairs)
-    return max((len(anchor) / len(name) for anchor in anchors if anchor in headline), default=0)
+    return max((len(anchor) / len(name) for anchor in anchors if anchor in headline), default=0) if anchors else 0
 
 
-def match_hotspots(snapshot, now=None, *, require_report=False):
+def match_hotspots(snapshot, now=None, *, require_report=False, max_age_hours=4):
     now = now or dt.datetime.now().astimezone()
-    cutoff = (now - dt.timedelta(hours=4)).timestamp()
-    articles = [(story, *_signature(story["title"])) for story in snapshot["articles"]
-                if not require_report or has_report(story)]
+    cutoff = (now - dt.timedelta(hours=max_age_hours)).timestamp()
+    latest = now.timestamp() + 600
+    boards = snapshot["ranks"]
+    fresh = {platform for platform, board in boards.items() if cutoff <= board.get("published", 0) <= latest}
+    articles = [(story, _signature(story["title"])) for story in snapshot["articles"]
+                if fresh and story.get("source_type") != "reference" and (not require_report or has_report(story))]
+    by_term = defaultdict(list)
+    for index, (_, (_, tokens, _)) in enumerate(articles):
+        for token in tokens:
+            by_term[token].append(index)
     matched = {}
-    for platform, board in snapshot["ranks"].items():
+    for platform, board in boards.items():
+        if platform not in fresh:
+            matched[platform] = [{**row, "article": None} for row in board.get("entries", [])]
+            continue
         rows = []
-        fresh = cutoff <= board.get("published", 0) <= now.timestamp() + 600
         for row in board.get("entries", []):
-            name, terms = _signature(row["title"])
+            topic = _signature(row["title"])
+            name, terms, _ = topic
             anchors = _anchors(row["title"])
             best, best_score = None, 0
-            if fresh and len(name) >= 4:
-                for article, headline, tokens in articles:
-                    score = _match_score(name, terms, anchors, headline, tokens)
+            if len(name) >= 4:
+                # Every scoring branch needs a shared trigram or an exact anchor.
+                # Original order still decides ties between equally complete reports.
+                candidates = set()
+                for term in terms | {anchor[:3] for anchor in anchors}:
+                    candidates.update(by_term.get(term, ()))
+                for index in sorted(candidates):
+                    article, signature = articles[index]
+                    score = _match_score(topic, anchors, signature)
                     if score > best_score or (score and score == best_score and has_report(article) and not has_report(best)):
                         best, best_score = article, score
             rows.append({**row, "article": best})
@@ -183,7 +242,7 @@ def match_hotspots(snapshot, now=None, *, require_report=False):
     return matched
 
 
-def _search_reports(row, now):
+def _search_reports(row, now, *, reference=False, output_dir=None):
     import requests
 
     title = row["title"]
@@ -191,13 +250,15 @@ def _search_reports(row, now):
     work = re.match(r"《([^》]{3,30})》", title)
     anchors = _anchors(title)
     query = work[1] if work else (max(anchors, key=len) if anchors else title[:72])
+    query = row.get('search_query') or query
     sources = (
+        ("https://cn.bing.com/search", {"q": query, "format": "rss"}),
         ("https://www.bing.com/search", {"q": query, "format": "rss"}),
         ("https://www.bing.com/news/search", {"q": query, "format": "rss", "cc": "us", "setlang": "zh-hans"}),
         ("https://news.google.com/rss/search", {"q": query, "hl": "zh-CN", "gl": "CN", "ceid": "CN:zh-Hans"}),
     )
-    name, terms = _signature(title)
-    if len(name) < 4:
+    topic = _signature(title)
+    if len(topic[0]) < 4:
         return []
     for endpoint, params in sources:
         try:
@@ -208,10 +269,11 @@ def _search_reports(row, now):
                     body.extend(chunk)
                     if len(body) > 1_500_000:
                         raise ValueError("新闻搜索 RSS 过大")
-                reports = parse_feed(bytes(body), now, search_results=True, allow_undated=endpoint.endswith(".com/search"))
+                reports = parse_feed(bytes(body), now, search_results=True,
+                                     allow_undated=endpoint.endswith(".com/search"), allow_older=reference)
         except (requests.RequestException, ValueError, ElementTree.ParseError):
             continue
-        ranked = sorted(((_match_score(name, terms, anchors, *_signature(report["title"])), i, report)
+        ranked = sorted(((_match_score(topic, anchors, _signature(report["title"])), i, report)
                          for i, report in enumerate(reports)), key=lambda entry: (-entry[0], entry[1]))
         usable = []
         for score, _, report in ranked:
@@ -225,12 +287,33 @@ def _search_reports(row, now):
             if _social_domain(urlsplit(report["url"]).hostname or ""):
                 continue
             report["headline_only"] = True
+            if reference:
+                # Web-search RSS dates can be crawl times, not publication dates.
+                report["published"] = ""
             usable.append(report)
-        if endpoint.startswith("https://www.bing.com/"):
+        if endpoint.startswith(("https://www.bing.com/", "https://cn.bing.com/")) or reference:
+            verified_reports = []
             for report in usable:
-                verified = _read_report(report, now)
+                verified = _read_report(report, now, allow_older=True) if reference else _read_report(report, now)
+                if reference and not has_report(verified):
+                    from core.browser_source import read_public_article
+                    verified = read_public_article(report["url"], output_dir) or verified
+                if reference and not has_report(verified) and output_dir is not None:
+                    from core.official_capture import capture_official_notice
+                    try:
+                        capture=capture_official_notice(report,output_dir)
+                    except (ValueError,OSError):
+                        capture=None
+                    if capture:
+                        page=capture['capture']
+                        verified={**report,'title':page['title'],'summary':page['summary'],'published':page['published'],
+                                  'source':page.get('source') or '官方通知','headline_only':False,'content_origin':'article'}
                 if has_report(verified):
-                    return [verified]
+                    if not reference:
+                        return [verified]
+                    verified_reports.append({**verified, "source_type": "reference"})
+            if verified_reports:
+                return verified_reports
         elif usable:
             return usable[:3]
     return []
@@ -240,53 +323,167 @@ def _social_domain(host):
     return any(host == domain or host.endswith("." + domain) for domain in _SOCIAL_DOMAINS)
 
 
+def collect_topic_reports(output_dir, anchor, now, *, query=""):
+    """Fetch the chosen topic, independently of the background ranking rotation."""
+    from core.editorial import source_options
+
+    snapshot = read_intake(output_dir, now)
+    chosen = source_options(snapshot, anchor, now, recommend=False)["anchor"]
+    query = query.strip() or chosen["title"]
+    if not 1 <= len(query) <= 160:
+        raise ValueError("请输入 1–160 字的资料关键词。")
+    topic, anchors = _signature(query), _anchors(query)
+    found = _search_reports({"title": query}, now, reference=True, output_dir=output_dir)
+    reports = []
+    for row in found:
+        if not _match_score(topic, anchors, _signature(row["title"])):
+            continue
+        verified = row if has_report(row) else _read_report(row, now, allow_older=True)
+        if has_report(verified):
+            reports.append(verified)
+    cutoff = (now - dt.timedelta(days=RETENTION_DAYS)).timestamp()
+    with closing(_connect(output_dir)) as db, db:
+        db.execute("DELETE FROM articles WHERE collected < ?", (cutoff,))
+        db.executemany("INSERT OR REPLACE INTO articles VALUES (?, ?, ?)",
+                       ((story_key(row), now.timestamp(), json.dumps(row, ensure_ascii=False)) for row in reports))
+    result = source_options(read_intake(output_dir, now), anchor, now, recommend=False, local_rank=True)
+    # Explicitly edited keywords may broaden the topic; keep that search visible in the UI.
+    result.update(collected=len(reports), collection_query=query, searched_ids=[story_key(row) for row in reports])
+    return result
+
+
 class _ArticleText(HTMLParser):
-    def __init__(self):
+    def __init__(self, container=None):
         super().__init__()
+        self.container = container
+        self.stack = []
+        self.body_depth = None
+        self.body_seen = False
         self.skip = 0
         self.paragraph = None
         self.parts = []
         self.published = ""
+        self.title = ""
+        self.site = ""
+        self.title_parts = []
+        self.in_title = False
+        self.in_heading = False
+        self.heading_parts = []
+        self.time_depth = None
+        self.clock = ''
+        self.media = []
+        self.pending_media = []
+
+    def _inside(self):
+        return self.container is None or self.body_depth is not None
+
+    def _finish_paragraph(self):
+        if self.paragraph is not None:
+            paragraph = " ".join("".join(self.paragraph).split())
+            if len(paragraph) >= (2 if self.container else 35) and paragraph not in self.parts:
+                self.parts.append(paragraph)
+                for index in self.pending_media:
+                    self.media[index]['context'] = paragraph[:350]
+                self.pending_media.clear()
+            self.paragraph = None
 
     def handle_starttag(self, tag, attrs):
+        fields = dict(attrs)
+        if tag in {'p', 'div', 'section', 'article', 'aside', 'footer', 'header', 'nav'}:
+            self._finish_paragraph()
+        if tag == "title":
+            self.in_title = True
+        if tag == 'h1':
+            self.in_heading = True
         if tag == "meta":
-            fields = dict(attrs)
-            if (fields.get("property") or fields.get("name") or fields.get("itemprop") or "").lower() in {
+            name = (fields.get("property") or fields.get("name") or fields.get("itemprop") or "").lower()
+            if name in {
                 "article:published_time", "pubdate", "publishdate", "pubtime", "datepublished", "og:release_date",
             }:
                 self.published = fields.get("content") or self.published
-        if tag in {"script", "style", "nav", "footer", "header", "aside"}:
-            self.skip += 1
-        if tag == "p" and not self.skip:
+            if name in {"og:title", "twitter:title"}:
+                self.title = fields.get("content") or self.title
+            if name in {"og:site_name", 'source'}:
+                self.site = fields.get("content") or self.site
+        blocked = (tag in {"script", "style", "nav", "footer", "header", "aside"}
+                   or fields.get('id') == 'articleEdit'
+                   or bool(set((fields.get('class') or '').split()) & {'adEditor', 'left_name'}))
+        if tag not in {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'}:
+            self.stack.append((tag, blocked))
+            self.skip += int(blocked)
+            if self.container and self.body_depth is None:
+                key, value = self.container
+                if tag == 'div' and value in (fields.get(key) or '').split():
+                    self.body_depth = len(self.stack)
+                    self.body_seen = True
+            if tag == 'span' and 'time' in (fields.get('class') or '').split():
+                self.time_depth = len(self.stack)
+        if tag == "p" and self._inside() and not self.skip:
             self.paragraph = []
+        if self.container and self._inside() and not self.skip and len(self.media) < 64:
+            video = tag == 'span' and 'pageVideo' in (fields.get('class') or '').split()
+            link = fields.get('video_src') if video else (fields.get('data-original') or fields.get('src')) if tag == 'img' else None
+            if link:
+                def dimension(key):
+                    value = fields.get(key) or ''
+                    return int(value) if value.isdecimal() and len(value) <= 5 else 0
+                self.media.append({'kind': 'video' if video else 'image', 'url': link,
+                    'poster': fields.get('poster') or '', 'width': dimension('video_width' if video else 'width'),
+                    'height': dimension('video_height' if video else 'height')})
+                self.pending_media.append(len(self.media)-1)
 
     def handle_endtag(self, tag):
-        if tag in {"script", "style", "nav", "footer", "header", "aside"}:
-            self.skip = max(0, self.skip - 1)
-        if tag == "p" and self.paragraph is not None:
-            paragraph = " ".join("".join(self.paragraph).split())
-            if len(paragraph) >= 35 and paragraph not in self.parts:
-                self.parts.append(paragraph)
-            self.paragraph = None
+        if tag == "title":
+            self.in_title = False
+        if tag == 'h1':
+            self.in_heading = False
+        if tag in {'p', 'div', 'section', 'article', 'aside', 'footer', 'header', 'nav'}:
+            self._finish_paragraph()
+        index = next((i for i in range(len(self.stack)-1, -1, -1) if self.stack[i][0] == tag), None)
+        if index is not None:
+            self.skip -= sum(int(blocked) for _, blocked in self.stack[index:])
+            del self.stack[index:]
+            if self.body_depth is not None and len(self.stack) < self.body_depth:
+                self.body_depth = None
+            if self.time_depth is not None and len(self.stack) < self.time_depth:
+                self.time_depth = None
 
     def handle_data(self, data):
-        if not self.skip and self.paragraph is not None:
+        if self.in_title:
+            self.title_parts.append(data)
+        if self.in_heading:
+            self.heading_parts.append(data)
+        if self.time_depth is not None and re.fullmatch(r'\s*\d{2}:\d{2}:\d{2}\s*', data):
+            self.clock = data.strip()
+        if self._inside() and not self.skip and self.paragraph is not None:
             self.paragraph.append(data)
 
+    def close(self):
+        super().close()
+        self._finish_paragraph()
 
-def _read_report(story, now=None):
+
+def _read_report(story, now=None, *, public_request=None, allow_older=False):
     import ipaddress
     import socket
     import requests
 
-    if not story.get("headline_only") and len(story.get("summary", "")) >= 1000:
+    manual = public_request is not None
+    if manual:
+        public_ipv6 = ipaddress.ip_network("2000::/3")
+    if story.get('content_origin') == 'article' or (story.get('content_origin') != 'feed'
+            and not story.get("headline_only") and len(story.get("summary", "")) >= 1000):
         return story
     url = story["url"]
     try:
         for _ in range(5):
+            if manual and (len(url) > 2048 or "\\" in url or any(c.isspace() or ord(c) < 32 for c in url)):
+                return story
             parts = urlsplit(url)
             host = parts.hostname
-            if (parts.scheme not in {"http", "https"} or not host or parts.username or parts.port not in {None, 80, 443}
+            if (parts.scheme not in {"http", "https"} or not host or parts.username is not None
+                    or parts.port not in {None, 80, 443}
+                    or (manual and (parts.scheme != "https" or parts.port not in {None, 443}))
                     or host in {"news.google.com", "www.bing.com", "cn.bing.com", "bing.com"}
                     or _social_domain(host)):
                 return story
@@ -295,39 +492,85 @@ def _read_report(story, now=None):
             ips = {ipaddress.ip_address(entry[4][0]) for entry in addresses}
             benchmark = ipaddress.ip_network("198.18.0.0/15")
             trusted_proxy_name = parts.scheme == "https" and host in _BENCHMARK_PUBLISHERS
-            if not ips or any(not ip.is_global and not (trusted_proxy_name and ip in benchmark) for ip in ips):
+            if not ips or any(ip.is_multicast or (not ip.is_global and not (trusted_proxy_name and ip in benchmark))
+                              for ip in ips):
                 return story
-            with requests.get(url, timeout=(4, 8), allow_redirects=False, stream=True) as response:
-                if response.is_redirect:
+            if manual and any(ip.version == 6 and (ip not in public_ipv6 or ip.sixtofour) for ip in ips):
+                return story
+            connection = (public_request(parts, min(ips, key=lambda ip: (ip.version, int(ip)))) if manual
+                          else requests.get(url, timeout=(4, 8), allow_redirects=False, stream=True))
+            with connection as response:
+                redirected = 300 <= response.status < 400 if manual else response.is_redirect
+                if redirected:
                     url = urljoin(url, response.headers["Location"])
                     continue
-                response.raise_for_status()
+                if manual:
+                    if not 200 <= response.status < 300:
+                        return story
+                    blocks = response.stream(65536)
+                    encoding = requests.utils.get_encoding_from_headers(response.headers)
+                else:
+                    response.raise_for_status()
+                    blocks = response.iter_content(65536)
+                    encoding = response.encoding
                 if "text/html" not in response.headers.get("Content-Type", ""):
                     return story
                 body = bytearray()
-                for block in response.iter_content(65536):
+                for block in blocks:
                     body.extend(block)
                     if len(body) > 2_000_000:
                         return story
-                encoding = response.encoding if response.encoding and response.encoding.lower() != "iso-8859-1" else "utf-8"
+                encoding = encoding if encoding and encoding.lower() != "iso-8859-1" else "utf-8"
                 raw = body.decode(encoding, errors="replace")
-                parser = _ArticleText()
+                container = ({'www.ithome.com': ('id', 'paragraph'),
+                              'www.chinanews.com.cn': ('class', 'left_zw'),
+                              'www.chinanews.com': ('class', 'left_zw'),
+                              'www.news.cn': ('id', 'detail')}).get(host)
+                if host == 'www.news.cn' and not re.fullmatch(r'/(?:[a-zA-Z0-9_-]+/)*\d{8}/[a-f0-9]{32}/c\.html', parts.path):
+                    container = None
+                parser = _ArticleText(container)
                 parser.feed(raw)
-                text = "\n".join(parser.parts)[:7000]
+                parser.close()
+                if container and not parser.body_seen:
+                    return story
+                text = "\n".join(parser.parts)
                 structured_body = re.search(r'"articleBody"\s*:\s*("(?:\\.|[^"\\])*")', raw)
-                if structured_body:
+                if structured_body and not container:
                     structured_text = plain_text(json.loads(structured_body[1]))[:7000]
                     if len(structured_text) > len(text):
                         text = structured_text
-                if len(text) >= MIN_REPORT_LENGTH and (story.get("headline_only") or len(text) > len(story.get("summary", ""))):
+                media = [{**row, 'url': urljoin(url, row['url']),
+                          'poster': urljoin(url, row['poster']) if row.get('poster') else ''} for row in parser.media]
+                candidate_report = {**story, 'url': url, 'media_candidates': media}
+                from core.source_media import candidates
+                has_video = any(row['kind'] == 'video' for row in candidates(candidate_report))
+                if len(text) >= (60 if has_video else MIN_REPORT_LENGTH) and (story.get('content_origin') == 'feed'
+                        or story.get("headline_only") or len(text) > len(story.get("summary", ""))):
                     published = story["published"]
                     if not published:
                         structured = re.search(r'"datePublished"\s*:\s*"([^"]+)"', raw)
-                        stamp = _feed_date(parser.published or (structured[1] if structured else ""))
-                        if not now or not now - dt.timedelta(hours=48) <= stamp <= now + dt.timedelta(minutes=10):
-                            return story
-                        published = stamp.isoformat()
-                    return {**story, "url": url, "published": published, "summary": text, "headline_only": False}
+                        raw_stamp = parser.published or (structured[1] if structured else "")
+                        if host == 'www.news.cn' and re.fullmatch(r'\d{4}-\d{2}-\d{2}', raw_stamp) and parser.clock:
+                            raw_stamp += 'T' + parser.clock + '+08:00'
+                        try:
+                            stamp = _feed_date(raw_stamp)
+                        except (TypeError, ValueError, OverflowError):
+                            if not manual and not allow_older:
+                                return story
+                        else:
+                            if not manual and (not now or stamp > now + dt.timedelta(minutes=10)
+                                               or not allow_older and stamp < now - dt.timedelta(hours=48)):
+                                return story
+                            published = stamp.isoformat()
+                    if manual or not story.get('title'):
+                        story = {**story, "title": plain_text(parser.title or "".join(parser.title_parts or parser.heading_parts))[:120],
+                                 "source": (plain_text(parser.site) or host)[:35]}
+                    credits = re.findall(r'(?m)^(?:作者|记者|摄制)[：:]\s*(.{1,120})', text)
+                    return {**story, "url": url, "published": published, "summary": text[:7000], "headline_only": False,
+                            'content_origin': 'article', 'summary_truncated': len(text) > 7000,
+                            **({'media_candidates': media} if media else {}),
+                            **({'content_type': 'video_article'} if has_video else {}),
+                            **({'author': '、'.join(credits[:3])} if credits and not story.get('author') else {})}
                 return story
     except (requests.RequestException, OSError, ValueError, KeyError):
         pass

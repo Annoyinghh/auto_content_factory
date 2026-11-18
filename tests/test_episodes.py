@@ -9,6 +9,77 @@ from test_daily import scratch_dir
 
 
 class EpisodeTests(unittest.TestCase):
+    def test_reference_programme_keeps_original_dates_and_is_not_labelled_today_news(self):
+        from core.episodes import episode_case
+        reports=[{'title':'第一种做法','source':'公开原文','url':'https://example.com/recipe',
+                  'published':'2020-11-29','source_type':'reference'}]
+        item={'story':{'title':'番茄炒蛋两种做法'},'editorial':{'reports':reports},
+              'chapters':[{'story':r,'reports':[r]} for r in reports]}
+        case=episode_case(item,'douyin',{})
+        self.assertNotIn('热点资讯',case['platform_metadata']['douyin']['tags'])
+        self.assertNotIn('今日',case['news']['series'])
+        self.assertEqual(case['news']['sources'][0]['published'],'2020-11-29')
+        self.assertTrue(case['news']['is_reference'])
+        from core.visual_engine import generate_episode_slide,wrap_text
+        shown=[]
+        def capture(text,*args):
+            shown.append(text)
+            return wrap_text(text,*args)
+        page={**case,'scenes':[{'layout':'brief','chapter':1}], 'chapter_starts':[{'scene':0}]}
+        with patch('core.visual_engine.wrap_text',side_effect=capture):
+            generate_episode_slide(page,0,360,640,'douyin',cover=True)
+        self.assertIn('热采  /  资料解读',shown)
+        self.assertFalse(any('今日' in text or '热点' in text for text in shown))
+        reports[0].pop('source_type')
+        news=episode_case(item,'douyin',{})
+        self.assertIn('热点资讯',news['platform_metadata']['douyin']['tags'])
+
+    def test_short_news_trim_keeps_whole_sentences_and_both_ends(self):
+        from core.editorial import _trim_short_chapter
+
+        first = "卫星拍到了冰山碎裂后的外形和分布。"
+        last = "末期影像记录的是拍摄时刻的状态。"
+        scenes = [{"text": first + "这张照片也刊登在网站上。"},
+                  {"text": "原来的主体已经分成了许多碎块。"},
+                  {"text": "照片拍摄时间和文章发布时间不同。" + last}]
+        self.assertLessEqual(_trim_short_chapter(scenes, 55), 55)
+        self.assertEqual(scenes[0]["text"], first)
+        self.assertEqual(scenes[-1]["text"], last)
+
+    def test_roundup_handoff_uses_each_report_and_never_carries_a_linked_photo_into_another_topic(self):
+        from PIL import Image
+
+        from core.workflow import edition_path, read_edition, run_stage, write_json
+
+        day = dt.date(2026, 11, 9)
+        reports = [{"id": f"report-{i}", "title": f"资讯 {i}", "source": f"机构 {i}",
+                    "published": f"2026-10-0{i+1}", "url": f"https://example.com/news/{i}"} for i in range(2)]
+        with scratch_dir() as root:
+            photo = root / "photo.jpg"
+            Image.new("RGB", (180, 120), "#428877").save(photo)
+            asset = {"kind": "image", "page_url": "local:photo", "title": "现场照片", "local": True,
+                     "path": str(photo), "preview": str(photo)}
+            scenes = [{"title": row["title"], "text": "报道说明了现场观察结果。", "media": asset["page_url"] if i else "",
+                       "motion": "dissolve", "zoom": True} for i, row in enumerate(reports)]
+            item = {"id": "edition", "story": reports[0], "video_style": {"id": "roundup"}, "media": [asset],
+                    "chapters": [{"story": row, "reports": [row]} for row in reports], "editorial": {"reports": reports},
+                    "edit": {"scenes": scenes, "chapter_starts": [{"scene": i, "title": row["title"]}
+                                                                for i, row in enumerate(reports)]}}
+            path = edition_path(root, day)
+            path.parent.mkdir(parents=True)
+            write_json(path, {"items": {"bilibili": item}})
+            run_stage("review_media", day, root, "bilibili", {"id": "edition", "page_url": asset["page_url"],
+                                                              "state": "approved", "report_id": reports[0]["id"]})
+            updated = read_edition(path)["items"]["bilibili"]
+            first, second = render_case(updated, "bilibili")["scenes"]
+            self.assertEqual(first["layout"], "footage")
+            self.assertEqual(first["asset"]["page_url"], asset["page_url"])
+            self.assertEqual(first["chapter_handoff"]["published"], reports[0]["published"])
+            self.assertEqual(second["chapter_handoff"]["source"], reports[1]["source"])
+            self.assertEqual(second["layout"], "roundup_intro")
+            self.assertNotIn("asset", second)
+            self.assertTrue(all(scene["motion"] == "cut" for scene in (first, second)))
+
     def test_chinese_magnitude_and_approximate_age_match_the_same_evidence(self):
         from core.episodes import _numbers
 
@@ -57,7 +128,8 @@ class EpisodeTests(unittest.TestCase):
                 item["edit"] = suggest_cut(item, "bilibili", work=root, references=["B站写法"])
             self.assertEqual(resumed.call_count, 4)
         self.assertEqual([start["title"] for start in item["edit"]["chapter_starts"]], ["资讯 2", "资讯 0", "资讯 1"])
-        self.assertEqual(item["edit"]["editorial_plan"], plan)
+        self.assertEqual({key: item["edit"]["editorial_plan"][key] for key in plan}, plan)
+        self.assertEqual(item["edit"]["editorial_plan"]["video_style"]["id"], "roundup")
         self.assertTrue(all(scene["motion"] == "pull" for scene in render_case(item, "bilibili")["scenes"]))
 
     def test_editor_rejects_invented_number_after_fact_review(self):

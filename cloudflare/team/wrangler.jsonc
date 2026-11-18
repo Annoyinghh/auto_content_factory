@@ -1,0 +1,25 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "acf-team",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-11-08",
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": { "enabled": true, "head_sampling_rate": 0.1 },
+  "vars": {
+    "R2_STORAGE_BYTES": "8000000000",
+    "R2_CLASS_A_LIMIT": "800000",
+    "R2_CLASS_B_LIMIT": "8000000"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "acf-team-local",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    { "binding": "VIDEOS", "bucket_name": "acf-team-local-videos" }
+  ]
+}

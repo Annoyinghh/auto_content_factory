@@ -4,7 +4,6 @@ from pathlib import Path
 from functools import cache
 
 BASE_DIR = Path(__file__).resolve().parent
-CORE_DIR = BASE_DIR / "core"
 ASSETS_DIR = BASE_DIR / "assets"
 APP_ICON = ASSETS_DIR / "screening" / "app.ico"
 DATA_DIR = (
@@ -27,9 +26,10 @@ FONT_REGULAR = r"C:\Windows\Fonts\msyh.ttc"      # Microsoft YaHei
 FONT_BOLD = r"C:\Windows\Fonts\msyhbd.ttc"       # Microsoft YaHei Bold
 if not os.path.exists(FONT_BOLD):
     FONT_BOLD = FONT_REGULAR
-FONT_HEI = r"C:\Windows\Fonts\simhei.ttf"        # SimHei
 
 # Platform Preset Dimensions
+DOUYIN_BRIEF_SECONDS = (60, 120, 180)
+
 PLATFORM_PRESETS = {
     "douyin": {
         "name": "抖音 (Douyin)",
@@ -70,18 +70,6 @@ PLATFORM_PRESETS = {
         "voice": "zh-CN-YunjianNeural",
         "rate": "+8%",
         "tone": "深度叙事、纪录片质感、商业本质拆解、有梗"
-    },
-    "wechat_channels": {
-        "name": "微信视频号 (Channels)",
-        "width": 1080,
-        "height": 1920,
-        "aspect_ratio": "9:16",
-        "fps": 30,
-        "sub_fontsize": 48,
-        "sub_bottom_margin": 340,
-        "voice": "zh-CN-YunxiNeural",
-        "rate": "+10%",
-        "tone": "认知跃迁、商业启示、沉稳专业、社交传播"
     }
 }
 
@@ -105,7 +93,6 @@ PROFILES = {
 
 CREATOR_URLS = {
     "douyin": "https://creator.douyin.com/creator-micro/content/upload",
-    "xiaohongshu": "https://creator.xiaohongshu.com/creator/post",
+    "xiaohongshu": "https://creator.xiaohongshu.com/publish/publish?source=official&target=video",
     "bilibili": "https://member.bilibili.com/platform/upload/video/frame",
-    "wechat_channels": "https://channels.weixin.qq.com/platform/post/create"
 }

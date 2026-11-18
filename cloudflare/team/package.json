@@ -1,0 +1,13 @@
+{
+  "name": "acf-team-service",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --ip 127.0.0.1",
+    "check": "wrangler deploy --dry-run",
+    "db:local": "wrangler d1 migrations apply DB --local"
+  },
+  "devDependencies": {
+    "wrangler": "4.158.0"
+  }
+}

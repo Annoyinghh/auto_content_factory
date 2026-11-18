@@ -6,16 +6,18 @@ from tkinter import font, ttk
 from PIL import Image, ImageDraw, ImageTk
 
 
-RAIL = "#19191d"
-PAGE = "#131317"
-SURFACE = "#222225"
-FIELD = "#17181c"
-LINE = "#3c3837"
-TEXT = "#f3eee6"
-MUTED = "#b2aaa4"
-ACCENT = "#76d1c4"
-AMBER = "#efb275"
-SELECTED = "#253a38"
+RAIL = "#eeedf4"
+PAGE = "#f5f3ed"
+SURFACE = "#fffefa"
+FIELD = "#fffefa"
+LINE = "#d7d8e2"
+TEXT = "#191d2a"
+MUTED = "#585e71"
+ACCENT = "#2d42d2"
+NAVY = "#192853"
+NAVY_MUTED = "#c6d1f5"
+AMBER = "#a43d1b"
+SELECTED = "#e5e9ff"
 FONT = "Microsoft YaHei UI"
 
 
@@ -34,12 +36,12 @@ def icon_bitmap(name, color=MUTED):
     tile = Image.new("RGBA", (64, 64))
     draw = ImageDraw.Draw(tile)
     if name == "brand":
-        draw.rounded_rectangle((1, 1, 62, 62), radius=15, fill="#242322", outline="#5c4b3b", width=2)
+        draw.rounded_rectangle((1, 1, 62, 62), radius=15, fill=ACCENT, outline="#2636b1", width=2)
         for x, dx in ((12, 11), (51, -11)):
             for y, dy in ((12, 11), (51, -11)):
-                draw.line([(x + dx, y), (x, y), (x, y + dy)], fill=AMBER, width=3)
-        draw.ellipse((22, 22, 41, 41), outline=ACCENT, width=3)
-        draw.polygon([(29, 27), (37, 32), (29, 37)], fill=ACCENT)
+                draw.line([(x + dx, y), (x, y), (x, y + dy)], fill="#b8c3ff", width=3)
+        draw.ellipse((22, 22, 41, 41), outline="#ffffff", width=3)
+        draw.polygon([(29, 27), (37, 32), (29, 37)], fill="#ffffff")
     elif name == "overview":
         for x in (12, 34):
             for y in (12, 34):
@@ -69,6 +71,15 @@ def icon_bitmap(name, color=MUTED):
     elif name == "accounts":
         draw.ellipse((22, 10, 42, 30), outline=color, width=4)
         draw.arc((12, 32, 52, 65), 195, 345, fill=color, width=4)
+    elif name == "team":
+        draw.rounded_rectangle((11, 13, 53, 45), radius=6, outline=color, width=4)
+        draw.line([(18, 45), (18, 53), (29, 45)], fill=color, width=4)
+        draw.line([(22, 29), (29, 35), (43, 23)], fill=color, width=4, joint="curve")
+    elif name == "operations":
+        draw.line([(32, 24), (32, 34), (16, 34), (16, 42)], fill=color, width=4, joint="curve")
+        draw.line([(32, 34), (48, 34), (48, 42)], fill=color, width=4, joint="curve")
+        for x, y in ((32, 16), (16, 50), (48, 50)):
+            draw.rounded_rectangle((x - 8, y - 8, x + 8, y + 8), radius=4, outline=color, width=4)
     elif name == "copywriting":
         draw.rounded_rectangle((15, 11, 49, 53), radius=5, outline=color, width=4)
         for y, right in ((23, 41), (32, 41), (41, 35)):
@@ -86,7 +97,8 @@ def icon_bitmap(name, color=MUTED):
 
 
 def _button(root, style, name, idle, active, selected, disabled):
-    surround = RAIL if name == "Nav.TButton" else SURFACE if name in {"Metric.TButton", "Segment.TButton"} else PAGE
+    surround = {"Nav.TButton": RAIL, "Platform.TButton": NAVY, "Metric.TButton": SURFACE,
+                "Segment.TButton": SURFACE, "Category.TButton": PAGE}.get(name, PAGE)
     pictures = [_chip(root, color, surround) for color in (idle, active, selected, disabled)]
     root._theme_images.extend(pictures)
     element = f"{name}.surface"
@@ -121,10 +133,16 @@ def apply_theme(root):
     style.configure("TLabel", background=PAGE, foreground=TEXT)
     style.configure("Rail.TLabel", background=RAIL, foreground=TEXT)
     style.configure("RailMuted.TLabel", background=RAIL, foreground=MUTED, font=(FONT, 9))
-    style.configure("Brand.TLabel", background=RAIL, foreground=TEXT, font=(FONT, 13, "bold"))
-    style.configure("Title.TLabel", font=(FONT, 24, "bold"))
+    style.configure("Brand.TLabel", background=RAIL, foreground=TEXT, font=(FONT, 12, "bold"))
+    style.configure("Masthead.TFrame", background=SURFACE)
+    style.configure("Masthead.TLabel", background=SURFACE, foreground=TEXT, font=(FONT, 10, "bold"))
+    style.configure("MastheadMuted.TLabel", background=SURFACE, foreground=MUTED, font=(FONT, 9))
+    style.configure("Title.TLabel", font=(FONT, 22, "bold"))
     style.configure("Headline.TLabel", font=(FONT, 16, "bold"))
     style.configure("Muted.TLabel", foreground=MUTED, font=(FONT, 9))
+    style.configure("DashboardTitle.TLabel", font=(FONT, 26, "bold"))
+    style.configure("DashboardDate.TLabel", foreground=MUTED, font=("Segoe UI", 11, "bold"))
+    style.configure("DashboardSection.TLabel", font=(FONT, 12, "bold"))
     style.configure("Panel.TFrame", background=SURFACE)
     surface = Image.new("RGB", (34, 34), PAGE)
     ImageDraw.Draw(surface).rounded_rectangle((0, 0, 33, 33), radius=13, fill=SURFACE, outline=LINE)
@@ -133,27 +151,33 @@ def apply_theme(root):
     style.element_create("ScreeningPanel.surface", "image", skin, border=15, sticky="nsew")
     style.layout("Rounded.TFrame", [("ScreeningPanel.surface", {"sticky": "nsew"})])
     for name, foreground, typography in (
-        ("Panel", TEXT, (FONT, 10)), ("PanelTitle", TEXT, (FONT, 11, "bold")),
+        ("Panel", TEXT, (FONT, 10)), ("PanelTitle", TEXT, (FONT, 12, "bold")),
         ("PanelMuted", MUTED, (FONT, 9)), ("PanelAccent", ACCENT, (FONT, 9, "bold")),
-        ("Number", TEXT, ("Segoe UI", 26, "bold")),
+        ("Number", TEXT, ("Segoe UI", 24, "bold")),
     ):
         style.configure(f"{name}.TLabel", background=SURFACE, foreground=foreground, font=typography)
     for name, colors in {
-        "TButton": ("#302d31", "#423a36", SELECTED, SURFACE),
-        "Accent.TButton": (AMBER, "#ffd6aa", AMBER, SURFACE),
-        "Nav.TButton": (RAIL, "#302a29", SELECTED, RAIL),
-        "Metric.TButton": (SURFACE, "#342e2b", SELECTED, SURFACE),
-        "Segment.TButton": ("#302d31", "#423a36", SELECTED, SURFACE),
+        "TButton": ("#e9eaf2", "#dce1fa", SELECTED, SURFACE),
+        "Accent.TButton": (ACCENT, "#3d50e3", "#2538b9", "#ebedf4"),
+        "Nav.TButton": (RAIL, "#dce1fa", SELECTED, RAIL),
+        "Metric.TButton": (SURFACE, "#e7eaff", SELECTED, SURFACE),
+        "Segment.TButton": ("#e9eaf2", "#dce1fa", SELECTED, SURFACE),
+        "Platform.TButton": (NAVY, "#314378", "#314378", NAVY),
+        "Category.TButton": (PAGE, "#eeedf4", SELECTED, PAGE),
     }.items():
         _button(root, style, name, *colors)
         style.configure(name, foreground=TEXT, padding=(9, 3), width=0, anchor="center", focusthickness=1)
-        style.map(name, foreground=[("disabled", "#56788a")])
-    style.configure("Nav.TButton", foreground=MUTED, anchor="w", padding=(9, 4))
+        style.map(name, foreground=[("disabled", "#666c80")])
+    style.configure("Nav.TButton", foreground=TEXT, anchor="w", padding=(9, 5), font=(FONT, 10))
     style.map("Nav.TButton", foreground=[("selected", ACCENT), ("active", TEXT)])
     style.configure("Metric.TButton", foreground=MUTED, anchor="w", padding=(3, 2), font=(FONT, 9))
     style.map("Metric.TButton", foreground=[("active", TEXT)])
     style.map("Segment.TButton", foreground=[("selected", ACCENT), ("active", TEXT)])
-    style.configure("Accent.TButton", foreground="#04121b", padding=(12, 4), font=(FONT, 10, "bold"))
+    style.configure("Platform.TButton", foreground=NAVY_MUTED, padding=(4, 1), font=(FONT, 9, "bold"), anchor="w")
+    style.map("Platform.TButton", foreground=[("active", "white")])
+    style.configure("Category.TButton", padding=(7, 2), anchor="w", font=(FONT, 9))
+    style.map("Category.TButton", foreground=[("selected", ACCENT)])
+    style.configure("Accent.TButton", foreground="#ffffff", padding=(12, 4), font=(FONT, 10, "bold"))
     style.configure("TEntry", fieldbackground=FIELD, padding=(8, 5), insertcolor=TEXT, lightcolor=FIELD, darkcolor=FIELD)
     style.configure("TCombobox", fieldbackground=FIELD, background=SURFACE, padding=(8, 5), arrowsize=12,
                     arrowcolor=MUTED, lightcolor=FIELD, darkcolor=FIELD)
@@ -165,13 +189,18 @@ def apply_theme(root):
     style.configure("Treeview", background=PAGE, fieldbackground=PAGE, foreground=TEXT, borderwidth=0, rowheight=38,
                     lightcolor=PAGE, darkcolor=PAGE)
     style.configure("Feed.Treeview", rowheight=41)
+    style.configure("Dashboard.Treeview", background=SURFACE, fieldbackground=SURFACE, rowheight=27,
+                    lightcolor=SURFACE, darkcolor=SURFACE, font=(FONT, 10))
+    style.configure("Dashboard.Treeview.Heading", background="#eeedf4", padding=(8, 4),
+                    lightcolor="#eeedf4", darkcolor="#eeedf4", font=(FONT, 9, "bold"))
+    style.map("Dashboard.Treeview.Heading", background=[("active", "#eeedf4")])
     style.configure("Treeview.Heading", background=SURFACE, foreground=MUTED, padding=(9, 8), borderwidth=0,
                     lightcolor=SURFACE, darkcolor=SURFACE, relief="flat", font=(FONT, 9))
     style.map("Treeview.Heading", background=[("active", SURFACE)])
     style.map("Treeview", background=[("selected", SELECTED)], foreground=[("selected", TEXT)])
     style.configure("Vertical.TScrollbar", background=LINE, troughcolor=PAGE, arrowcolor=MUTED, arrowsize=10,
                     borderwidth=0, lightcolor=LINE, darkcolor=LINE)
-    style.map("Vertical.TScrollbar", background=[("active", "#474b56")])
+    style.map("Vertical.TScrollbar", background=[("active", "#b5bfdc")])
     root.after_idle(lambda: _native_caption(root))
 
 
@@ -182,7 +211,7 @@ def _native_caption(root):
 
     try:
         handle = ctypes.c_void_p(int(root.frame(), 0))
-        value = ctypes.c_int(1)
+        value = ctypes.c_int(0)
         ctypes.windll.dwmapi.DwmSetWindowAttribute(handle, 20, ctypes.byref(value), ctypes.sizeof(value))
         for attribute, rgb in ((35, RAIL), (36, TEXT)):
             colorref = ctypes.c_uint(int.from_bytes(bytes.fromhex(rgb[1:]), "little"))

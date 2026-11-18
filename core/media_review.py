@@ -2,6 +2,9 @@
 
 
 def media_state(item, asset):
+    if any(item.get("media_review", {}).get(source["page_url"]) == "removed"
+           for source in asset.get("comparison", {}).get("sources", ())):
+        return "removed"
     default = "pending" if "editorial" in item and not asset.get("local") else "approved"
     return item.get("media_review", {}).get(asset["page_url"], default)
 

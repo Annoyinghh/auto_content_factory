@@ -11,21 +11,23 @@ import threading
 import time
 import tkinter as tk
 import webbrowser
+from functools import cached_property
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from PIL import Image, ImageTk
 
-from config import APP_ICON, DATA_DIR, OUTPUT_DIR, PLATFORM_PRESETS, PROFILES, get_ffmpeg
-from core.desktop_jobs import desktop_command, run_worker, worker_main
+from config import APP_ICON, BASE_DIR, DATA_DIR, OUTPUT_DIR, PLATFORM_PRESETS, PROFILES, get_ffmpeg
+from core.desktop_jobs import desktop_command, run_worker
+from core.douyin_profiles import douyin_profiles, profile_directory, save_profile
 from core.intake import REFRESH_MINUTES, read_intake
 from core.media_review import usable_media
 from core.workflow import MANUAL_TITLE_LIMIT, edition_path, read_edition, release_directory, run_hot_daily, run_stage
 from studio_dashboard import OperationsDashboard, recent_editions
-from studio_departments import IntakeDesk, ReleaseDesk
+from studio_departments import IntakeDesk, ReleaseDesk, prepare_intake_view
 from studio_editorial import EditorialPicker
-from studio_copywriting import CopyDesk
-from studio_library import MediaLibrary, MatrixPage
+from studio_editor import StoryboardTimeline
+from studio_library import MediaLibrary, MatrixPage, WorksLibrary, load_thumbnail
 from studio_shell import SCREENING, ScrollArea, WorkbenchShell, heading, panel
 from studio_theme import AMBER, FIELD, TEXT, apply_theme, icon
 
@@ -56,11 +58,19 @@ class Desk:
         self.root = root
         self.jobs = queue.Queue()
         self.readers = []
+        self.post_panel = None
+        self.operations_task = None
+        try:
+            self.douyin_accounts = douyin_profiles(DATA_DIR)
+        except (OSError, ValueError) as error:
+            self.douyin_accounts = {}
+            root.after_idle(lambda message=str(error): messagebox.showerror("无法读取抖音账号", message, parent=root))
         self.edition = {}
         self.busy = False
         self.active = set()
         self.publishing = False
         self.collecting = False
+        self.intake_request = self.intake_applied = 0
         self.collection_done = threading.Event()
         self.collection_done.set()
         self.cover = None
@@ -81,29 +91,33 @@ class Desk:
         stage.columnconfigure(0, weight=1)
         stage.rowconfigure(0, weight=1)
         self.sections = {}
-        for key in ("collection", "trends", "production", "release", "accounts"):
+        for key in ("trends", "production", "release", "accounts", "team", "operations"):
             self.sections[key] = ttk.Frame(stage, padding=(24, 20, 24, 16))
-        collection, trends, production, release = (self.sections[key] for key in ("collection", "trends", "production", "release"))
-        self.intake = IntakeDesk(collection, trends, NAMES, self.start_editorial)
+        topic_area, production, release = (self.sections[key] for key in ("trends", "production", "release"))
+        self.topic_tabs = ttk.Notebook(topic_area)
+        self.topic_tabs.pack(fill="both", expand=True)
+        trends, collection, brief = (ttk.Frame(self.topic_tabs, padding=(0, 10, 0, 0)) for _ in range(3))
+        self.topic_views = {"trends": trends, "collection": collection, "brief": brief}
+        for view, title in ((trends, "平台热点"), (collection, "采集报道"), (brief, "素材组装")):
+            self.topic_tabs.add(view, text=title)
+        self.intake = IntakeDesk(collection, trends, NAMES, self.start_editorial, self.open_hotspot_writing)
         self.release = ReleaseDesk(release, NAMES, PUBLISHERS, self.open_accounts, self.load_editions,
                                    lambda platform, payload: self.launch("hold", platform, payload), self.publish_batch,
-                                   self.select_work_date)
-        self.dashboard = OperationsDashboard(stage, NAMES, self.show_department, self.open_dashboard_day,
-                                             self.open_trends, self.new_from_stage)
-        self.clips = MediaLibrary(stage, NAMES, self.open_production, self.new_from_stage, clips=True, read_work=self.read_work)
-        self.matrix = MatrixPage(self.sections["accounts"], NAMES, self.open_accounts)
-        self.sections.update(overview=self.dashboard, clips=self.clips)
+                                   self.prepare_selected_post, self.select_work_date, self.share_for_review)
+        self.release.set_douyin_profiles(self.douyin_accounts)
+        self.dashboard = OperationsDashboard(stage, NAMES, self.show_department, self.open_trends, data_dir=DATA_DIR)
+        self.sections.update(overview=self.dashboard, clips=ttk.Frame(stage))
         self.page = None
-        self.editions = {}
         for frame in self.sections.values():
             frame.grid(row=0, column=0, sticky="nsew")
             frame.grid_remove()
 
-        header = heading(production, "AI 创作", "确认报道后，分批写稿并试剪开场。")
+        header = heading(production, "AI 创作", "把组装好的内容写成分镜，试剪后继续编辑和导出。")
         ttk.Button(header, text="从平台热点选题", style="Accent.TButton",
                    command=lambda: self.show_department("trends")).pack(side="right")
         ttk.Button(header, text="从采集库选题",
                    command=lambda: self.show_department("collection")).pack(side="right", padx=(0, 7))
+        ttk.Button(header, text="图文／文字", command=self.open_copywriting).pack(side="right", padx=(0, 7))
         style = ttk.Style(root)
         style.configure("Workbench.TNotebook", borderwidth=0, tabmargins=(0, 0, 0, 4))
         style.configure("Workbench.TNotebook.Tab", borderwidth=0, padding=(15, 7))
@@ -111,14 +125,15 @@ class Desk:
         self.production_tabs.pack(fill="both", expand=True)
         self.story_tab = ttk.Frame(self.production_tabs, padding=(0, 9, 0, 0))
         self.assets = MediaLibrary(self.production_tabs, NAMES, self.open_production, self.import_from_library,
-                                   review_asset=self.review_asset, play_asset=self.play_asset)
+                                   self.start, review_asset=self.review_asset, play_asset=self.play_asset)
         self.writing_tab = ttk.Frame(self.production_tabs)
         self.production_tabs.add(self.story_tab, text="选题与分镜")
         self.production_tabs.add(self.assets, text="素材库")
         self.production_tabs.add(self.writing_tab, text="批量文案")
-        self.copywriting = CopyDesk(self.writing_tab, self.start, embedded=True)
         self.production_tabs.bind("<<NotebookTabChanged>>", self.refresh_production_tab)
-        self.picker = EditorialPicker(self.story_tab, NAMES, self.confirm_editorial, self.close_picker)
+        self.picker = EditorialPicker(brief, NAMES, self.confirm_editorial, self.close_picker,
+                                      self.open_team_summary, read_link=self.read_editorial_link)
+        self.picker.frame.pack(fill="both", expand=True)
         self.picker_request = None
         self.picker_day = None
         self.progress_check = 0.0
@@ -133,7 +148,6 @@ class Desk:
         self.status = ttk.Label(self.story_tab, style="Muted.TLabel", wraplength=620)
         self.status.pack(side="bottom", anchor="w", pady=(8, 0))
         content = ttk.Frame(self.story_tab)
-        self.story_content = content
         content.pack(fill="both", expand=True, pady=(4, 0))
         content.columnconfigure(1, weight=1)
         content.rowconfigure(0, weight=1)
@@ -143,20 +157,53 @@ class Desk:
         self.channels.column("#0", width=106, stretch=False)
         self.channels.column("state", width=98, stretch=False)
         self.channels.grid(row=0, column=0, sticky="ns", padx=(0, 18))
-        self.channels.bind("<<TreeviewSelect>>", lambda event: self.show_story())
+        self.channels.bind("<<TreeviewSelect>>", lambda event: self.show_story() if self.page == "production" else None)
         details = ScrollArea(content)
         details.grid(row=0, column=1, sticky="nsew")
         self.detail = details.body
         self.detail.configure(padding=(0, 0, 8, 6))
         self.load_editions()
-        self.update_intake(read_intake(OUTPUT_DIR))
         self.show_department("overview")
         root.bind("<Escape>", lambda event: self.show_department("overview"))
+        self.root.after(120, self.poll)
+        self.refresh_intake()
         if "--check" not in sys.argv:
-            self.root.after(120, self.poll)
             self.check_schedule()
             self.root.after(700, self.auto_collection)
-            self.root.after_idle(self.start_local_ai)
+            self.root.after_idle(lambda: threading.Thread(target=self.start_local_ai, daemon=True).start())
+
+    @cached_property
+    def copywriting(self):
+        from studio_copywriting import CopyDesk
+
+        return CopyDesk(self.writing_tab, self.start, embedded=True)
+
+    @cached_property
+    def clips(self):
+        library = WorksLibrary(self.sections["clips"], NAMES, self.open_production, self.new_from_stage,
+                               self.start, read_work=self.read_work, output_dir=OUTPUT_DIR,
+                               open_writing=self.open_copywriting)
+        library.pack(fill="both", expand=True)
+        return library
+
+    @cached_property
+    def matrix(self):
+        return MatrixPage(self.sections["accounts"], NAMES, self.open_accounts,
+                          self.edit_douyin_account, self.connect_douyin_account)
+
+    @cached_property
+    def team(self):
+        from studio_team import TeamDesk
+
+        return TeamDesk(self.sections["team"], NAMES, DATA_DIR, self.start, self.read_work,
+                        self.open_review_release)
+
+    @cached_property
+    def operations(self):
+        from studio_operations import OperationsDesk
+
+        return OperationsDesk(self.sections["operations"], NAMES, DATA_DIR, self.start,
+                              self.open_operations_release)
 
     @staticmethod
     def start_local_ai():
@@ -170,7 +217,6 @@ class Desk:
     def open_production(self, platform):
         if self.channels.exists(platform):
             self.channels.selection_set(platform)
-            self.show_story()
         self.show_department("production")
         self.production_tabs.select(self.story_tab)
 
@@ -182,7 +228,11 @@ class Desk:
         self.intake.show_trends(query=query)
         self.show_department("trends")
 
-    def start_editorial(self, anchor, *, platform=None, checked=()):
+    def open_hotspot_writing(self, platform, topic, count=None):
+        self.show_department("copywriting")
+        self.copywriting.use_hotspot(platform, topic, count=count)
+
+    def start_editorial(self, anchor, *, platform=None, checked=(), target_seconds=None, brief=None):
         if platform is None:
             self.select_work_date(dt.date.today().isoformat())
         platform = platform or anchor.get("platform") or (self.channels.selection() or ("xiaohongshu",))[0]
@@ -190,27 +240,33 @@ class Desk:
         token = object()
         self.picker_request = token
         self.picker_day = day
-        self.open_production(platform)
-        self.status.configure(text="正在推荐相关报道")
+        self.picker.clear("正在关联本机采集的报道…")
+        self.show_department("brief")
 
         def ready(result, error):
             if self.picker_request is not token or self.date.get() != day:
                 return
             if error:
-                self.status.configure(text=f"无法打开选题 · {error}")
+                self.picker.message.set(f"无法打开选题 · {error}")
                 return
-            self.story_content.pack_forget()
-            self.picker.load(result, platform, checked)
-            self.picker.frame.pack(fill="both", expand=True)
-            self.status.configure(text="")
+            self.picker.load(result, platform, checked, target_seconds, brief)
 
         self.start(lambda: run_worker("editorial_sources", day, OUTPUT_DIR, platform, anchor), ready)
+
+    def read_editorial_link(self, url, ready):
+        day = self.date.get()
+        self.start(lambda: run_worker("editorial_link", day, OUTPUT_DIR, payload={"url": url}), ready)
 
     def close_picker(self):
         self.picker_request = None
         self.picker_day = None
-        self.picker.frame.pack_forget()
-        self.story_content.pack(fill="both", expand=True, pady=(4, 0))
+        self.picker.clear()
+        if self.page == "trends":
+            self.topic_tabs.select(self.topic_views["trends"])
+
+    def open_team_summary(self, summary):
+        self.show_department("operations")
+        self.operations.stage_summary(summary, kind="storyboard")
 
     def confirm_editorial(self, platform, payload):
         day = self.date.get()
@@ -219,34 +275,34 @@ class Desk:
             return
         self.active.add(key)
         self.picker.busy = True
-        self.picker.update_note()
-        self.status.configure(text="正在保存本期选用的报道")
+        self.picker.controls_state()
+        self.picker.message.set("正在保存本次选用的资料…")
         request = self.picker_request
 
         def ready(item, error):
             self.active.discard(key)
             if self.picker_request is request:
                 self.picker.busy = False
-                self.picker.update_note()
+                self.picker.controls_state()
             if error:
-                self.status.configure(text=f"报道未确认 · {error}")
+                if self.picker_request is request:
+                    self.picker.message.set(f"资料未确认 · {error}")
                 return
             if self.picker_request is request:
                 self.close_picker()
             self.load_editions()
             if self.date.get() == day and not self.picker_request:
                 self.open_production(platform)
-            self.launch("editorial_preview", platform, item["id"], day=day)
+            self.launch("editorial_preview", platform, {"id": item["id"], "direct": True}, day=day)
 
         self.start(lambda: run_worker("editorial_create", day, OUTPUT_DIR, platform, payload), ready)
 
     def refresh_production_tab(self, _event=None):
-        if self.production_tabs.select() == str(self.assets):
+        tab = self.production_tabs.select()
+        if tab == str(self.assets):
             self.assets.set_data(self.edition, self.date.get(), self.release.rows)
-
-    def open_dashboard_day(self, day):
-        self.select_work_date(day.isoformat())
-        self.show_department("clips")
+        elif tab == str(self.writing_tab):
+            self.copywriting
 
     def select_work_date(self, day):
         values = self.date.cget("values")
@@ -295,7 +351,9 @@ class Desk:
             self.show_department("production")
             self.production_tabs.select(self.assets if key == "assets" else self.writing_tab)
             return
-        previous = self.page
+        if key in self.topic_views:
+            self.topic_tabs.select(self.topic_views[key])
+            key = "trends"
         self.page = key
         for name, frame in self.sections.items():
             if name == key:
@@ -303,27 +361,22 @@ class Desk:
             else:
                 frame.grid_remove()
         self.shell.show(key)
-        if key == "overview":
-            if previous != key or not self.dashboard.graph.winfo_viewable():
-                self.root.after_idle(lambda: self.dashboard.graph.reveal(entrance=True) if self.page == "overview" else None)
-        else:
-            self.dashboard.graph.stop()
-            self.dashboard.graph.highlight(None)
         if key == "release":
             self.update_release()
+        elif key == "team":
+            self.team.refresh()
+        elif key == "operations":
+            self.operations.refresh()
         elif key == "accounts":
-            self.matrix.update(self.release.rows)
+            self.matrix.update(self.release.rows, self.douyin_accounts)
         elif key == "clips":
-            self.sections[key].set_data(self.edition, self.date.get(), self.release.rows)
+            self.clips.set_data(self.edition, self.date.get(), self.release.rows)
         elif key == "production":
+            self.show_story()
             self.refresh_production_tab()
 
-    def update_intake(self, snapshot):
-        self.intake.update(snapshot)
-        self.update_dashboard()
-
     def update_dashboard(self):
-        self.dashboard.set_data(self.intake.snapshot, getattr(self.intake, "matched", {}), self.editions, self.release.rows)
+        self.dashboard.set_data(self.intake.snapshot, self.douyin_accounts, self.release.rows)
 
     def start(self, action, completed):
         def worker():
@@ -388,37 +441,54 @@ class Desk:
 
     def auto_collection(self):
         self.root.after(REFRESH_MINUTES * 60 * 1000, self.auto_collection)
-        if self.collecting:
-            return
-        snapshot = read_intake(OUTPUT_DIR)
-        checked = snapshot["checked"] or 0
-        if dt.datetime.now().timestamp() - checked < REFRESH_MINUTES * 60:
-            self.update_intake(snapshot)
-            return
-        self.collecting = True
-        self.collection_done.clear()
-        day = dt.date.today()
+        self.refresh_intake(collect=True)
 
-        def collect():
+    def refresh_intake(self, *, collect=False):
+        if collect:
+            if self.collecting:
+                return
+            self.collecting = True
+            self.collection_done.clear()
+        self.intake_request += 1
+        request = self.intake_request
+
+        def load():
             try:
-                return run_worker("intake", day, OUTPUT_DIR)
+                snapshot = read_intake(OUTPUT_DIR)
+                if collect and time.time() - (snapshot["checked"] or 0) >= REFRESH_MINUTES * 60:
+                    snapshot = run_worker("intake", dt.date.today(), OUTPUT_DIR)
             finally:
-                self.collection_done.set()
+                if collect:
+                    self.collection_done.set()
+            return prepare_intake_view(snapshot)
 
         def finished(result, error):
-            self.collecting = False
-            if error:
-                logging.warning("Background collection did not finish: %s", error)
+            if collect:
+                self.collecting = False
+            if request < self.intake_applied:
                 return
-            self.update_intake(result)
+            if error:
+                logging.warning("Background intake did not finish: %s", error)
+                if not self.intake_applied:
+                    self.intake.collection_date.configure(text="暂时无法读取采集库")
+                return
+            self.intake_applied = request
+            self.intake.update(*result)
+            self.update_dashboard()
+            if collect and not self.active:
+                self.start(lambda: run_worker("refresh_writing_library", dt.date.today(), OUTPUT_DIR),
+                           self.refresh_open_cases)
 
-        self.start(collect, finished)
+        self.start(load, finished)
+
+    def refresh_open_cases(self, _result, error):
+        if not error and "copywriting" in self.__dict__:
+            self.copywriting.refresh_cases()
 
     def load_editions(self):
         today = dt.date.today().isoformat()
         current = self.date.get() or today
         dates = {today, current, *(path.parent.name for path in (OUTPUT_DIR / "daily").glob("*/edition.json"))}
-        self.editions = recent_editions(OUTPUT_DIR, (dt.date.fromisoformat(day) for day in sorted(dates, reverse=True)[:31]))
         self.date.configure(values=sorted(dates, reverse=True))
         self.date.set(current if current in dates else today)
         self.show_edition()
@@ -443,19 +513,23 @@ class Desk:
                     state = "提交待核对"
             self.channels.insert("", "end", iid=platform, text=name, values=(state,))
         self.channels.selection_set(selected)
-        self.show_story()
         self.update_release()
         if self.page == "clips":
-            self.sections[self.page].set_data(self.edition, self.date.get(), self.release.rows)
+            self.clips.set_data(self.edition, self.date.get(), self.release.rows)
         elif self.page == "production":
+            self.show_story()
             self.refresh_production_tab()
 
     def update_release(self):
         pending_review = any(stage == "hold" and day == self.date.get() for stage, day, _ in self.active)
         self.release.update(self.edition, self.date.get(), OUTPUT_DIR, self.publishing or pending_review)
-        self.release.show_week(self.editions, self.date.get())
+        if self.page == "release":
+            selected = dt.date.fromisoformat(self.date.get())
+            monday = selected - dt.timedelta(days=selected.weekday())
+            editions = recent_editions(OUTPUT_DIR, (monday + dt.timedelta(days=i) for i in range(7)))
+            self.release.show_week(editions, self.date.get())
         if self.page == "accounts":
-            self.matrix.update(self.release.rows)
+            self.matrix.update(self.release.rows, self.douyin_accounts)
         self.update_dashboard()
 
     def show_story(self):
@@ -491,7 +565,9 @@ class Desk:
             outline = "\n".join(f"{i + 1:02d}  {chapter['title']}" for i, chapter in enumerate(markers[:3]))
             if len(item["chapters"]) > 3:
                 outline += f"\n其余 {len(item['chapters']) - 3} 条资讯可在编辑分镜中查看。"
-            ttk.Label(self.detail, text=f"目标 10–15 分钟 · {len(item['chapters'])} 条资讯\n{outline}",
+            seconds = item.get("target_seconds", 720)
+            duration = f"约 {seconds // 60} 分钟" if platform == "douyin" and seconds <= 180 else "10–15 分钟"
+            ttk.Label(self.detail, text=f"目标 {duration} · {len(item['chapters'])} 条资讯\n{outline}",
                       wraplength=wrap, style="Muted.TLabel").pack(anchor="w", pady=(8, 4))
         if item.get("hotspot"):
             hotspot = item["hotspot"]
@@ -623,12 +699,27 @@ class Desk:
         editorial = item["editorial"]
         draft = item.get("edit") or item.get("suggestion")
         busy = any(self.is_active(step, platform) for step in
-                   ("editorial_create", "editorial_preview", "editorial_export", "save", "import_media"))
+                   ("editorial_create", "editorial_preview", "visual_direct", "editorial_export", "save", "import_media", "media"))
         state = "disabled" if busy else "normal"
         border, body = panel(self.detail, padding=(12, 10))
         border.pack(fill="x", pady=(10, 8))
-        ttk.Label(body, text=f"本期资料 · {len(editorial['reports'])} 篇   /   目标 10–15 分钟",
+        seconds = item.get("target_seconds", 720)
+        duration_label = f"约 {seconds // 60} 分钟" if seconds <= 180 else "10–15 分钟"
+        ttk.Label(body, text=f"本期资料 · {len(editorial['reports'])} 篇   /   目标 {duration_label}",
                   style="PanelTitle.TLabel").pack(anchor="w")
+        if brief := editorial.get("brief"):
+            inputs = {f"report:{row['id']}": row["title"] for row in editorial["reports"]}
+            inputs.update({f"note:{index}": note for index, note in enumerate(brief["notes"])})
+            inputs.update({f"asset:{index}": Path(name).name for index, name in enumerate(brief["asset_paths"])})
+            focus = brief["focus_id"]
+            focus = focus if focus.startswith("note:") else f"report:{focus}"
+            if focus in inputs:
+                ttk.Label(body, text=f"讲述重点 · {brief.get('focus_quote') or inputs[focus]}", style="PanelAccent.TLabel",
+                          wraplength=wrap).pack(anchor="w", pady=(3, 1))
+            ordered = [inputs[key].splitlines()[0][:76] for key in brief["sequence"] if key in inputs]
+            if ordered:
+                ttk.Label(body, text="本次输入  " + "  →  ".join(ordered),
+                          wraplength=wrap, style="PanelMuted.TLabel").pack(anchor="w", pady=(3, 2))
         for report in editorial["reports"]:
             row = ttk.Frame(body, style="Panel.TFrame")
             row.pack(fill="x", pady=2)
@@ -637,22 +728,67 @@ class Desk:
                       style="PanelMuted.TLabel").pack(side="left", fill="x")
         tools = ttk.Frame(self.detail)
         tools.pack(fill="x", pady=(0, 8))
-        ttk.Button(tools, text="调整报道", state=state, command=lambda: self.start_editorial(
-            editorial["anchor"], platform=platform, checked=[row["id"] for row in editorial["reports"]])).pack(side="left")
-        ttk.Button(tools, text="导入素材", state=state, command=lambda: self.import_media(platform)).pack(side="left", padx=6)
+        ttk.Button(tools, text="调整素材组装", state=state, command=lambda: self.start_editorial(
+            editorial["anchor"], platform=platform, checked=[row["id"] for row in editorial["reports"]],
+            target_seconds=seconds, brief=editorial.get("brief"))).pack(side="left")
+        if item.get("chapters"):
+            ttk.Button(tools, text="搜片头素材", state=state, command=lambda: self.launch(
+                "media", platform, on_success=lambda: self.show_department("assets"))).pack(side="left", padx=(6, 0))
+        ttk.Button(tools, text="导入片头素材", state=state, command=lambda: self.import_media(
+            platform, opening=True)).pack(side="left", padx=6)
         ttk.Button(tools, text="生成开场试剪" if draft else "继续生成试剪", state=state, style="Accent.TButton",
-                   command=lambda: self.launch("editorial_preview", platform, item["id"])).pack(side="left")
+                   command=lambda: self.launch("editorial_preview", platform,
+                                               {"id": item["id"], "direct": True})).pack(side="left")
         if draft:
+            monitor = tk.Frame(self.detail, background="#192853", padx=8, pady=6)
+            monitor.pack(fill="x", pady=(1, 5))
+            preview = item.get("preview") or {}
+            valid_preview = item.get("preview_revision") in {
+                item.get("edit_revision"), item.get("suggestion_revision"), item.get("opening_revision")
+            }
+            picture = load_thumbnail(preview.get("cover"), (218, 110)) if valid_preview else None
+            if picture:
+                frame = tk.Label(monitor, background="#192853")
+                frame.image = ImageTk.PhotoImage(picture, master=frame)
+                frame.configure(image=frame.image)
+                frame.pack(side="left")
+            tk.Label(monitor, text="试剪画面" if picture else "分镜已生成 · 等待试剪画面",
+                     background="#192853", foreground="#e5eaff", padx=7).pack(side="left")
+            timeline = StoryboardTimeline(
+                self.detail, draft["scenes"], seconds,
+                (lambda index: self.edit_cut(platform, draft, initial_scene=index)) if not busy else None,
+            )
+            timeline.pack(fill="x", pady=(0, 7))
             ttk.Button(tools, text="审看编辑分镜", state=state, command=lambda: self.edit_cut(platform, draft)).pack(
                 side="left", padx=6)
+            day = self.date.get()
+
+            def review_rewrite():
+                current = self.edition.get("items", {}).get(platform, {})
+                if self.date.get() == day and current.get("id") == item["id"] and current.get("suggestion"):
+                    self.edit_cut(platform, current["suggestion"], day=day)
+
+            ttk.Button(self.detail, text="按案例重写分镜", state=state, command=lambda: self.launch(
+                "editorial_preview", platform, {"id": item["id"], "rewrite": True, "direct": True}, day=day,
+                on_success=review_rewrite)).pack(anchor="w", pady=(0, 5))
+            ttk.Button(self.detail, text="视觉设计与看图选镜", state=state, command=lambda: self.launch(
+                "visual_direct", platform, {"id": item["id"]}, day=day,
+                on_success=review_rewrite)).pack(anchor="w", pady=(0, 5))
             length = sum(len(shot["text"]) for shot in draft["scenes"])
             ttk.Label(self.detail, text=f"口播约 {length:,} 字 · 导出前按实际配音校验时长",
                       style="Muted.TLabel").pack(anchor="w", pady=(2, 4))
+            ttk.Label(self.detail, text="片头会自动插入通过审核的相关照片和视频。审核后可重新生成试剪。",
+                      style="Muted.TLabel", wraplength=wrap).pack(anchor="w", pady=(0, 4))
             if direction := draft.get("editorial_plan", {}).get("throughline"):
                 ttk.Label(self.detail, text=direction, wraplength=wrap, style="Muted.TLabel").pack(anchor="w", pady=(2, 4))
             for index, marker in enumerate(draft.get("chapter_starts", []), 1):
                 ttk.Label(self.detail, text=f"{index:02d}  {marker['title']}", style="Muted.TLabel",
                           wraplength=wrap).pack(anchor="w", pady=2)
+                if reference := marker.get("style_reference"):
+                    ttk.Button(self.detail, text=f"写法案例 ↗  {reference['title']}",
+                               command=lambda url=reference["url"]: webbrowser.open(url)).pack(anchor="w", pady=(0, 4))
+                elif "style_reference" in marker:
+                    ttk.Label(self.detail, text="未匹配到同平台的相关作品", style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
         revision = item.get("edit_revision") or item.get("suggestion_revision") or item.get("opening_revision")
         review = ttk.Frame(self.detail)
         review.pack(fill="x", pady=8)
@@ -660,9 +796,12 @@ class Desk:
         if preview and item.get("preview_revision") == revision:
             ttk.Button(review, text="播放开场试剪", command=lambda: self.read_work(
                 preview, f"{item['story']['title']} · 开场试剪", NAMES[platform], preview.get("cover"))).pack(side="left")
+        elif preview and item.get("preview_revision") == item.get("suggestion_revision"):
+            ttk.Button(review, text="播放候选试剪", command=lambda: self.read_work(
+                preview, f"{item['story']['title']} · 候选试剪", NAMES[platform], preview.get("cover"))).pack(side="left")
         elif preview:
             ttk.Label(review, text="试剪已过期", style="Muted.TLabel").pack(side="left")
-        ttk.Button(review, text="确认并导出长片", style="Accent.TButton",
+        ttk.Button(review, text="确认并导出视频", style="Accent.TButton",
                    state=state if item.get("edit") else "disabled",
                    command=lambda: self.launch("editorial_export", platform, {
                        "id": item["id"], "revision": item["edit_revision"]})).pack(side="left", padx=6)
@@ -671,6 +810,8 @@ class Desk:
                 package, item["story"]["title"], NAMES[platform], package.get("cover"))).pack(side="left")
         if progress := item.get("editorial_progress"):
             ttk.Label(self.detail, text=progress, style="Muted.TLabel", wraplength=wrap).pack(anchor="w")
+        if item.get("warnings"):
+            ttk.Label(self.detail, text=" · ".join(item["warnings"]), style="Muted.TLabel", wraplength=wrap).pack(anchor="w")
         if error := item.get("error"):
             ttk.Label(self.detail, text=error, style="Muted.TLabel", wraplength=wrap).pack(anchor="w")
 
@@ -717,7 +858,7 @@ class Desk:
             command=lambda: self.launch(stage, platform),
         ).pack(side="left", padx=(6, 0))
 
-    def launch(self, stage, platform=None, payload=None, *, day=None, on_success=None):
+    def launch(self, stage, platform=None, payload=None, *, day=None, on_success=None, on_error=None):
         day = day or self.date.get()
         key = (stage, day, platform)
         if key in self.active:
@@ -725,7 +866,7 @@ class Desk:
         self.active.add(key)
         labels = {"collect": "采集资讯", "media": "采集素材", "draft": "载入分镜", "save": "保存分镜", "create": "新建选题",
                   "select_episode": "核对所选热点的报道", "preview": "渲染开场试剪",
-                  "editorial_preview": "自动生成试剪", "editorial_export": "导出长片",
+                  "editorial_preview": "自动生成试剪", "editorial_export": "导出视频", "visual_direct": "视觉设计与选镜",
                   "import_media": "导入本地素材", "ai": "生成 AI 草稿", "render": "剪辑成片", "hold": "更新审片状态",
                   "review_media": "审核素材"}
         label = labels[stage]
@@ -738,25 +879,31 @@ class Desk:
             self.load_editions()
             if error:
                 self.status.configure(text=f"{label}失败 · {error}")
-                if stage == "review_media":
+                if on_error:
+                    on_error(error)
+                elif stage == "review_media":
                     messagebox.showerror("素材审核未完成", str(error), parent=self.root)
                 return
             self.status.configure(text=f"{label}完成")
             if stage == "draft" and self.date.get() == day:
-                self.edit_cut(platform, result)
+                self.edit_cut(platform, result["draft"], version=result)
             if on_success:
                 on_success()
 
+        if stage == "draft":
+            payload = {"with_revision": True}
         self.start(lambda: run_worker(stage, day, OUTPUT_DIR, platform, payload), finished)
 
-    def import_media(self, platform):
+    def import_media(self, platform, *, opening=False):
         day = self.date.get()
+        issue_id = self.edition.get("items", {}).get(platform, {}).get("id")
         filename = filedialog.askopenfilename(
-            title="选择可用于发布的本地素材", parent=self.root,
+            title="选择片头素材" if opening else "选择可用于发布的本地素材", parent=self.root,
             filetypes=(("照片和视频", ("*.jpg", "*.jpeg", "*.png", "*.mp4", "*.mov", "*.webm")),),
         )
         if filename:
-            self.launch("import_media", platform, filename, day=day)
+            payload = {"id": issue_id, "filename": filename} if opening else filename
+            self.launch("import_media", platform, payload, day=day)
 
     def new_story(self, platform):
         day = self.date.get()
@@ -770,28 +917,67 @@ class Desk:
         draft = {"scenes": [{"title": heading, "text": "", "media": "", "zoom": False} for heading in ("开场", "正文")]}
         self.edit_cut(platform, draft, day=day, new_title=title)
 
-    def edit_cut(self, platform, draft, *, day=None, new_title=None, initial_scene=0):
+    def edit_cut(self, platform, draft, *, day=None, new_title=None, initial_scene=0, version=None):
         from studio_editor import CutEditor
 
         day = day or self.date.get()
         item = {} if new_title else self.edition["items"][platform]
         media = usable_media(item)
+        version = version or {"episode_id": item.get("id"), "edit_revision": item.get("edit_revision"),
+                              "suggestion_revision": item.get("suggestion_revision")}
+
+        def failed(error):
+            if editor.window.winfo_exists():
+                messagebox.showerror("分镜未保存", str(error), parent=editor.window)
 
         def save(value, saved):
             if new_title:
-                self.launch("create", platform, {"title": new_title, "cut": value}, day=day, on_success=saved)
+                self.launch("create", platform, {"title": new_title, "cut": value}, day=day,
+                            on_success=saved, on_error=failed)
             else:
-                if item.get("id"):
-                    value["episode_id"] = item["id"]
-                self.launch("save", platform, value, day=day, on_success=saved)
+                payload = {**value, "episode_id": version["episode_id"], "expected_revision": version["edit_revision"],
+                           "expected_suggestion_revision": version["suggestion_revision"],
+                           "draft_source": "suggestion" if draft == item.get("suggestion") else "edit"}
+                self.launch("save", platform, payload, day=day, on_success=saved, on_error=failed)
 
-        CutEditor(self.root, NAMES[platform], draft, media, save, initial_scene=initial_scene)
+        editor = CutEditor(self.root, NAMES[platform], draft, media, save, initial_scene=initial_scene)
 
     def open_accounts(self, platform="douyin"):
         from studio_accounts import AccountDesk
 
         dialog = AccountDesk(self.root, NAMES, self.start, platform)
         dialog.window.bind("<Destroy>", lambda event: self.root.after_idle(self.update_release) if event.widget == dialog.window else None)
+
+    def edit_douyin_account(self, profile_id=None):
+        if self.publishing:
+            return
+        label = simpledialog.askstring(
+            "抖音账号备注", "给这个账号起个方便辨认的名字。",
+            initialvalue=self.douyin_accounts.get(profile_id, ""), parent=self.root,
+        )
+        if label is None:
+            return
+        try:
+            saved = save_profile(DATA_DIR, label, profile_id=profile_id)
+            self.douyin_accounts = douyin_profiles(DATA_DIR)
+        except (OSError, ValueError, RuntimeError) as error:
+            messagebox.showerror("账号备注未保存", str(error), parent=self.root)
+            return
+        self.release.set_douyin_profiles(self.douyin_accounts)
+        self.update_release()
+        self.matrix.douyin.selection_set(saved)
+        self.matrix.douyin.see(saved)
+        if profile_id is None:
+            self.connect_douyin_account(saved)
+
+    def connect_douyin_account(self, profile_id):
+        if self.publishing or (self.post_panel and self.post_panel.poll() is None):
+            messagebox.showinfo("抖音面板已打开", "请先关闭当前抖音面板。", parent=self.root)
+            return
+        try:
+            self.open_douyin_panel(self.root.winfo_id(), profile_id, "login")
+        except (OSError, ValueError, RuntimeError) as error:
+            messagebox.showerror("无法打开抖音账号", str(error), parent=self.root)
 
     def read_work(self, package, title, platform, cover, chapter=0, *, autoplay=False):
         video = package.get("video")
@@ -810,7 +996,9 @@ class Desk:
             messagebox.showerror("阅读器未打开", str(error), parent=self.root)
 
     def close_readers(self):
-        for reader in self.readers:
+        for reader in [*self.readers, self.post_panel]:
+            if reader is None:
+                continue
             if reader.poll() is None:
                 reader.terminate()
                 reader.wait(timeout=2)
@@ -842,7 +1030,7 @@ class Desk:
         def done(result, error):
             self.busy = False
             self.produce_episode.configure(state="normal")
-            self.update_intake(read_intake(OUTPUT_DIR))
+            self.refresh_intake()
             self.date.set(dt.date.today().isoformat())
             self.load_editions()
             if error:
@@ -855,6 +1043,108 @@ class Desk:
             self.status.configure(text="  ·  ".join([message, *errors]))
 
         self.start(produce, done)
+
+    def prepare_selected_post(self):
+        selected = self.release.selected_browser_post()
+        if not selected:
+            return
+        platform, video = selected
+        day = self.date.get()
+        open_panel = None
+        linked_task = None
+        if platform == "douyin":
+            if self.post_panel and self.post_panel.poll() is None:
+                self.release.result.set("抖音 · 请在已打开的投稿面板继续操作。")
+                return
+            owner = self.root.winfo_id()
+            profile_id = self.release.selected_douyin_profile()
+            open_panel = lambda url, **draft: self.open_douyin_panel(owner, profile_id, url)
+            if self.operations_task:
+                client, task = self.operations_task
+                if (client is self.operations.client and task["platform"] == platform
+                        and task["account_label"] == self.douyin_accounts.get(profile_id)
+                        and task["title"] == self.release.rows[platform]["title"]):
+                    linked_task = self.operations_task
+        self.publishing = True
+        self.update_release()
+        waiting = "如需登录，请扫码。进入投稿页后会自动上传。" if open_panel else "正在把成片交给浏览器投稿页…"
+        self.release.result.set(f"{NAMES[platform]} · {waiting}")
+
+        def finished(result, error):
+            self.publishing = False
+            self.load_editions()
+            messages = {
+                "ready": "视频已交给投稿页，标题和文案已填好。请核对个人账号、上传进度和发布设置。",
+                "partial": "视频已交给投稿页。请补齐未填写的项目，核对账号后发布。",
+                "no_form": "没有找到空白投稿表单。请在创作者后台登录或打开新投稿页后重试。",
+                "no_connection": ("投稿面板未连接或扫码超时。请关闭面板后重试。" if open_panel else
+                                  "投稿助手未连接。请在默认浏览器启用扩展，登录创作者后台后重试。"),
+                "transfer_error": "成片传输未完成。请检查浏览器和投稿助手扩展。",
+                "needs_check": "请先检查当前投稿页的上传和填稿情况，再决定是否重试。",
+                "closed": "已关闭投稿面板，成片未传入。",
+            }
+            message = str(error) if error else messages.get(result, "请在创作者后台核对投稿页。")
+            self.release.result.set(f"{NAMES[platform]} · {message}")
+            if (not error and result == "ready" and linked_task and linked_task is self.operations_task
+                    and linked_task[0] is self.operations.client):
+                self.operations.record_prepared(linked_task[1])
+
+        self.start(lambda: run_stage("browser_post", day, OUTPUT_DIR, platform, {"video": video},
+                                     open_post_panel=open_panel), finished)
+
+    def open_review_release(self, review=None):
+        self.show_department("release")
+        if review is not None:
+            self.release.set_review_base(review)
+
+    def open_operations_release(self, publication=None):
+        self.show_department("release")
+        self.operations_task = (self.operations.client, publication) if publication else None
+        self.release.set_operations_task(publication, self.clear_operations_task)
+        if publication and self.release.tree.exists(publication["platform"]):
+            self.release.tree.selection_set(publication["platform"])
+            self.release.select()
+
+    def clear_operations_task(self):
+        self.operations_task = None
+        self.release.set_operations_task(None)
+
+    def share_for_review(self):
+        selected = self.release.selected_team_review()
+        if not selected:
+            return
+        platform, video = selected
+        current = read_edition(edition_path(OUTPUT_DIR, self.date.get()))["items"].get(platform, {})
+        package = current.get("package") or {}
+        if (package.get("video") != video or current.get("edit_revision") != current.get("package_revision")
+                or current.get("held_video") == video):
+            self.release.result.set("成片版本已更新，请刷新队列后再送审。")
+            return
+        previous = self.release.previous_review
+
+        def clear_review_base():
+            if self.release.previous_review is previous:
+                self.release.set_review_base(None)
+
+        self.show_department("team")
+        self.team.share(platform, package, previous_id=previous["id"] if previous else None,
+                        on_success=clear_review_base if previous else None)
+
+    def open_douyin_panel(self, owner, profile_id, request):
+        frozen = getattr(sys, "frozen", False)
+        helper = (BASE_DIR if frozen else BASE_DIR / "build") / "post_panel" / "PostingPanel.exe"
+        extension = (Path(sys.executable).parent if frozen else BASE_DIR) / "browser_extension"
+        if not helper.is_file() or not (extension / "manifest.json").is_file():
+            raise RuntimeError("找不到抖音投稿面板或投稿助手，请重新打包工作台。")
+        profile = profile_directory(DATA_DIR, profile_id)
+        process = subprocess.Popen(
+            [str(helper), str(owner), str(profile), str(extension), self.douyin_accounts[profile_id]],
+            stdin=subprocess.PIPE, creationflags=NO_WINDOW,
+        )
+        self.post_panel = process
+        with process.stdin as channel:
+            channel.write(request.encode("ascii") + b"\n")
+        return process
 
     def publish_batch(self):
         if self.publishing or self.release.busy:
@@ -890,39 +1180,6 @@ class Desk:
         self.start(submit, finished)
 
 def main():
-    if len(sys.argv) == 3 and sys.argv[1] == "--reader":
-        from studio_reader import reader_main
-
-        return reader_main(sys.argv[2])
-    if len(sys.argv) == 4 and sys.argv[1] == "--worker":
-        return worker_main(*sys.argv[2:])
-    if "--web" in sys.argv:
-        from studio_web import main as web_main
-        return web_main()
-    if "--intake" in sys.argv:
-        logging.basicConfig(filename=DATA_DIR / "collection.log", encoding="utf-8", level=logging.INFO)
-        try:
-            run_stage("intake", dt.date.today())
-        except Exception:
-            logging.exception("后台采集未完成")
-            return 1
-        return 0
-    if "--daily" in sys.argv:
-        logging.basicConfig(filename=DATA_DIR / "daily.log", encoding="utf-8", level=logging.INFO,
-                            format="%(asctime)s %(levelname)s %(message)s")
-        try:
-            edition, errors = run_hot_daily(progress=logging.info, invoke=run_worker)
-        except Exception:
-            logging.exception("今日制作启动失败")
-            return 1
-        ready = sum(item["status"] == "ready" for item in edition["items"].values())
-        for error in [*edition["feed_errors"], *errors]:
-            logging.warning("%s", error)
-        for platform, item in edition["items"].items():
-            if item["status"] == "failed":
-                logging.error("%s · %s", platform, item["error"])
-        logging.info("成片 %s / %s", ready, len(PROFILES))
-        return 0 if ready and not errors else 1
     root = tk.Tk()
     desk = Desk(root)
     if "--check" in sys.argv:
@@ -940,12 +1197,9 @@ def main():
                     desk.show_department(next_page)
                     root.after_idle(lambda: root.after(75, lambda: navigate(next_page, time.monotonic()+12)))
                     return
-                graph = desk.dashboard.graph
-                graph.motion = False
-                yaw = graph.yaw
-                graph.turn(.18)
-                if not graph.find_all() or graph.yaw == yaw:
-                    raise RuntimeError("运营图表未绘制或无法改变视角。")
+                # Tk may unmap the report table while it sits below the canvas viewport.
+                if not desk.dashboard.report_tree.winfo_manager() or desk.picker.records or desk.picker.selected:
+                    raise RuntimeError("今日面板或素材组装初始状态异常。")
             except Exception as error:
                 errors.append(error)
             root.quit()
@@ -957,7 +1211,7 @@ def main():
             raise errors[0]
         subprocess.run([get_ffmpeg(), "-version"], check=True, capture_output=True, creationflags=NO_WINDOW)
         (DATA_DIR / "desktop-check.txt").write_text(
-            f"Tk UI, {len(desk.sections)} views, 3D chart and bundled FFmpeg OK\n", encoding="utf-8",
+            f"Tk UI, {len(desk.sections)} views, today dashboard and bundled FFmpeg OK\n", encoding="utf-8",
         )
         if len(sys.argv) == 3 and sys.argv[1] == "--check":
             issue = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
@@ -979,4 +1233,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    from studio_entry import run_command
+
+    result = run_command()
+    sys.exit(main() if result is None else result)

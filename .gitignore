@@ -6,6 +6,19 @@ __pycache__/
 .pytest_cache/
 
 # Local data, credentials, and generated files
+/accounts/
+/browser/
+/xhs-reference-browser/
+/team-cache/
+/team-data/
+/operations/
+/cloudflare/team/.wrangler/
+/cloudflare/team/node_modules/
+/cloudflare/team/.dev.vars*
+/cloudflare/team/wrangler.production.jsonc
+/cloudflare/operations/.wrangler/
+/cloudflare/operations/.dev.vars*
+/cloudflare/operations/wrangler.production.jsonc
 /.env
 /.env.*
 *.pem

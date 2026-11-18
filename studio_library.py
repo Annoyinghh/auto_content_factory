@@ -10,10 +10,12 @@ from tkinter import ttk
 
 from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageTk
 
+from config import OUTPUT_DIR, PLATFORM_PRESETS
 from core.media_review import media_state
+from core.works_library import duration_label, load_works
 from studio_dashboard import PLATFORM_COLORS
 from studio_shell import SCREENING, PhotoBanner, ScrollArea, heading, panel
-from studio_theme import AMBER, FIELD, FONT, MUTED, PAGE, TEXT
+from studio_theme import ACCENT, AMBER, FIELD, FONT, LINE, MUTED, PAGE, TEXT
 
 
 @dataclass
@@ -43,6 +45,16 @@ def thumbnail(path, size):
     return _thumbnail(str(path), Path(path).stat().st_mtime_ns, size)
 
 
+def load_thumbnail(preview, size, fallback=None):
+    for path in (preview, fallback):
+        if path:
+            try:
+                return thumbnail(path, size)
+            except (OSError, ValueError):
+                continue
+    return None
+
+
 class CoverStage(tk.Canvas):
     """Light the shelf from the work's own cover while keeping the cover legible."""
 
@@ -52,12 +64,6 @@ class CoverStage(tk.Canvas):
         self.entry, self.selected, self.platform = entry, selected, platform
         self.render_size = None
         self.cover = None
-        for path in (entry.preview, SCREENING / "viewfinder.png"):
-            try:
-                self.cover = thumbnail(path, (760, 540))
-                break
-            except (OSError, ValueError):
-                continue
         self.backdrop = self.create_image(0, 0, anchor="nw")
         self.corner = self.create_polygon(0, 0, 0, 0, 0, 0, fill=AMBER, state="hidden")
         if platform:
@@ -68,8 +74,14 @@ class CoverStage(tk.Canvas):
             self.bind("<Button-1>", lambda event: open_issue())
         self.bind("<Configure>", self.paint)
 
-    def paint(self, event):
-        w, h = event.width, event.height
+    def set_cover(self, cover):
+        if cover is not None:
+            self.cover = cover
+            self.render_size = None
+            self.paint()
+
+    def paint(self, event=None):
+        w, h = (event.width, event.height) if event else (self.winfo_width(), self.winfo_height())
         if w < 80 or h < 80 or self.render_size == (w, h):
             return
         self.render_size = (w, h)
@@ -131,10 +143,11 @@ class CoverStage(tk.Canvas):
 
 
 class MediaLibrary(ScrollArea):
-    def __init__(self, parent, names, open_editor, primary_action, *, clips=False, read_work=None, review_asset=None,
+    def __init__(self, parent, names, open_editor, primary_action, start, *, clips=False, read_work=None, review_asset=None,
                  play_asset=None):
         super().__init__(parent)
         self.names, self.open_editor, self.clips = names, open_editor, clips
+        self.start = start
         self.rows = []
         self.read_work = read_work
         self.review_asset = review_asset
@@ -145,6 +158,7 @@ class MediaLibrary(ScrollArea):
         self.covers = []
         self.search_timer = None
         self.cards_timer = None
+        self.cards_revision = None
         title = "作品书架" if clips else "素材库"
         subtitle = "打开一本影像刊物，按章翻看成片。" if clips else "先看素材和来源，审核可用后可加入分镜。"
         header = heading(self.body, title, subtitle, kicker="热采放映室  /  作品收藏" if clips else None)
@@ -232,6 +246,7 @@ class MediaLibrary(ScrollArea):
         self.rows.append(LibraryEntry(key, title, detail, cover, video, previous, package, modified))
 
     def redraw(self):
+        revision = self.cards_revision = object()
         if self.cards_timer is not None:
             self.after_cancel(self.cards_timer)
             self.cards_timer = None
@@ -260,8 +275,7 @@ class MediaLibrary(ScrollArea):
             ttk.Label(card, text="没有符合筛选的内容。" if self.rows else self.empty, style="PanelMuted.TLabel").pack(anchor="w")
         playable = [row for row in rows if row.modified and not row.previous]
         featured = max(playable, key=lambda row: row.modified, default=None) if self.clips else None
-        if featured:
-            self.featured(featured, columns)
+        feature = self.featured(featured, columns) if featured else None
         if self.clips and rows:
             rail = ttk.Frame(self.grid_body)
             rail.grid(row=int(bool(featured)), column=0, columnspan=columns, sticky="ew", pady=(0, 9))
@@ -273,13 +287,31 @@ class MediaLibrary(ScrollArea):
         def add_row(start):
             self.cards_timer = None
             end = min(start + columns, stop)
+            images = []
+            if start == 0 and feature:
+                images.append((featured.preview, feature.set_cover))
             for index in range(start, end):
-                self.card(rows[index], first_row + index // columns, index % columns, columns)
-            if end < stop:
-                self.cards_timer = self.after(20, lambda: add_row(end))
-            elif stop < len(rows):
-                ttk.Button(self.grid_body, text=f"显示更多 · 还有 {len(rows)-stop} 项", command=self.show_more).grid(
-                    row=(stop + columns-1)//columns + first_row, column=0, columnspan=columns, pady=9)
+                entry = rows[index]
+                apply_image = self.card(entry, first_row + index // columns, index % columns, columns)
+                images.append((entry.preview, apply_image))
+
+            def ready(frames, error):
+                if self.cards_revision is not revision or not self.winfo_exists():
+                    return
+                if not error:
+                    for (_, apply_image), frame in zip(images, frames, strict=True):
+                        if frame is not None:
+                            apply_image(frame)
+                if end < stop:
+                    self.cards_timer = self.after(20, lambda: add_row(end))
+                elif stop < len(rows):
+                    ttk.Button(self.grid_body, text=f"显示更多 · 还有 {len(rows)-stop} 项", command=self.show_more).grid(
+                        row=(stop + columns-1)//columns + first_row, column=0, columnspan=columns, pady=9)
+
+            if images:
+                size = (760, 540) if self.clips else (206, 120)
+                fallback = SCREENING / "viewfinder.png" if self.clips else None
+                self.start(lambda: [load_thumbnail(path, size, fallback) for path, _ in images], ready)
 
         add_row(0)
 
@@ -288,18 +320,13 @@ class MediaLibrary(ScrollArea):
         self.redraw()
 
     @staticmethod
-    def artwork(parent, entry):
+    def show_artwork(thumb, frame=None):
         size = (206, 120)
-        thumb = tk.Label(parent, bg=FIELD, bd=0)
         tile = Image.new("RGB", size, FIELD)
-        try:
-            frame = thumbnail(entry.preview, size)
+        if frame is not None:
             tile.paste(frame, ((size[0]-frame.width)//2, (size[1]-frame.height)//2))
-        except (OSError, ValueError):
-            pass
         thumb.picture = ImageTk.PhotoImage(tile, master=thumb)
         thumb.configure(image=thumb.picture)
-        return thumb
 
     def open_issue(self, row):
         self.selected_video = row.path
@@ -312,6 +339,7 @@ class MediaLibrary(ScrollArea):
                              selected=self.selected_video in (None, entry.path))
         feature.grid(row=0, column=0, columnspan=columns, sticky="ew", pady=(0, 15))
         self.covers.append(feature)
+        return feature
 
     def card(self, row, y, x, columns):
         key, title, detail, preview, path, previous = row.key, row.title, row.detail, row.preview, row.path, row.previous
@@ -322,8 +350,12 @@ class MediaLibrary(ScrollArea):
                                selected=bool(row.path and row.path == self.selected_video))
             cover.pack(fill="x")
             self.covers.append(cover)
+            apply_image = cover.set_cover
         else:
-            self.artwork(body, row).pack(fill="x")
+            thumb = tk.Label(body, bg=FIELD, bd=0)
+            self.show_artwork(thumb)
+            thumb.pack(fill="x")
+            apply_image = lambda image: self.show_artwork(thumb, image)
         name = ttk.Label(body, text=title, wraplength=210, style="PanelTitle.TLabel")
         name.pack(anchor="w", pady=(9, 4))
         if self.clips:
@@ -349,12 +381,351 @@ class MediaLibrary(ScrollArea):
             else:
                 caption, action = "打开", lambda: os.startfile(path)
             ttk.Button(buttons, text=caption, command=action).pack(side="right")
+        return apply_image
+
+
+def work_format(work):
+    return {"video": "视频", "preview": "试剪视频", "image": "图文笔记",
+            "text": "笔记文稿" if (work.draft or {}).get("pages") else "纯文字笔记",
+            "copy": "文案", "production": "创作草稿"}[work.kind]
+
+
+class AlbumCover(tk.Canvas):
+    """A deck of saved editions; an unillustrated work uses its own title."""
+
+    def __init__(self, parent, platform):
+        self.mat, self.edge, self.back, self.ink = (
+            ("#f4e7dd", "#cd9a82", "#e7c2ae", "#763c2d") if platform == "xiaohongshu"
+            else ("#e8ebf8", "#8292cb", "#b2beeb", "#314887")
+        )
+        super().__init__(parent, bg=self.mat, height=151, width=1, bd=0, highlightthickness=0)
+        self.work = self.art = None
+        self.count = 1
+        self.bind("<Configure>", self.paint)
+
+    def update_work(self, work, count, art=None):
+        self.work, self.count, self.art = work, count, art
+        self.paint()
+
+    def paint(self, _event=None):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if not self.work or min(w, h) < 55:
+            return
+        fw, fh = min(140, w - 38), min(111, h - 20)
+        x, y = (w-fw)//2, (h-fh)//2
+        if self.count > 1:
+            for dx, skew in ((-12, -8), (12, 8)):
+                self.create_polygon(x+dx, y+skew+5, x+dx+fw, y-skew+5, x+dx+fw, y+fh-skew+2,
+                                    x+dx, y+fh+skew+2, fill=self.back, outline=self.edge)
+        self.create_rectangle(x+2, y+4, x+fw+3, y+fh+4, fill=self.edge, outline="")
+        self.create_rectangle(x, y, x+fw, y+fh, fill=self.ink, outline="")
+        if self.art:
+            picture = ImageOps.contain(self.art, (fw-2, fh-2))
+            self.picture = ImageTk.PhotoImage(picture, master=self)
+            self.create_image(w//2, h//2, image=self.picture)
+        else:
+            self.picture = None
+            self.create_text(x+10, y+11, text=work_format(self.work), anchor="nw", fill="#fff6ef",
+                             font=(FONT, 8, "bold"))
+            title = self.work.title
+            if len(title) > 33:
+                title = title[:32].rstrip() + "…"
+            self.create_text(x+10, y+32, text=title, width=fw-20, anchor="nw", fill="white",
+                             font=(FONT, 10, "bold"))
+
+
+class WorksLibrary(ScrollArea):
+    def __init__(self, parent, names, open_editor, primary_action, start, *, read_work,
+                 output_dir=OUTPUT_DIR, open_writing=None):
+        super().__init__(parent)
+        self.names, self.open_editor, self.start = names, open_editor, start
+        self.read_work, self.open_writing, self.output_dir = read_work, open_writing, output_dir
+        self.albums, self.day, self.limit = (), "", 10
+        self.pending = self.timer = self.loading = None
+        self.error = False
+
+        top = heading(self.body, "作品库", "按选题整理各平台的成片、试剪和笔记。", kicker="作品库  /  选题专辑")
+        ttk.Button(top, text="＋  AI 创作", style="Accent.TButton", command=primary_action).pack(side="right")
+        controls = ttk.Frame(self.body)
+        controls.pack(fill="x", pady=(0, 16))
+        self.platform = tk.StringVar(value="所有平台")
+        platforms = ttk.Combobox(controls, state="readonly", values=("所有平台", *names.values()),
+                                 textvariable=self.platform, width=10)
+        platforms.pack(side="left", padx=(0, 12))
+        platforms.bind("<<ComboboxSelected>>", self.filter_changed)
+        self.date_filter = tk.StringVar(value="全部日期")
+        dates = ttk.Combobox(controls, state="readonly", values=("全部日期", "当前工作日"),
+                             textvariable=self.date_filter, width=10)
+        dates.pack(side="left", padx=(0, 13))
+        dates.bind("<<ComboboxSelected>>", self.filter_changed)
+        ttk.Label(controls, text="搜索选题或作品", style="Muted.TLabel").pack(side="left", padx=(0, 6))
+        self.query = tk.StringVar()
+        ttk.Entry(controls, textvariable=self.query, width=22).pack(side="left")
+        self.query.trace_add("write", self.filter_changed)
+        self.count = ttk.Label(controls, style="Muted.TLabel")
+        self.count.pack(side="right")
+        self.shelf = ttk.Frame(self.body)
+        self.shelf.pack(fill="x")
+
+    def set_data(self, edition, day, release_rows=None):
+        self.pending = (edition, str(day), release_rows or {})
+        if not self.loading:
+            self.load()
+
+    def load(self):
+        edition, day, release_rows = self.pending
+        self.loading, self.pending = True, None
+        if not self.albums:
+            self.count.configure(text="正在读取作品…")
+
+        def ready(albums, error):
+            self.loading = False
+            if not self.winfo_exists():
+                return
+            if self.pending:
+                self.load()
+                return
+            changed = self.albums != albums or self.day != day or self.error != bool(error)
+            if self.day != day:
+                self.limit = 10
+            self.day, self.error = day, bool(error)
+            if not error:
+                self.albums = albums
+            if changed or not self.albums:
+                self.redraw()
+
+        self.start(lambda: load_works(self.output_dir, edition=edition, day=day, release_rows=release_rows), ready)
+
+    def filter_changed(self, *_args):
+        if self.timer:
+            self.after_cancel(self.timer)
+        self.limit = 10
+        self.timer = self.after(110, self.redraw)
+
+    def redraw(self):
+        if self.timer:
+            self.after_cancel(self.timer)
+            self.timer = None
+        for widget in self.shelf.winfo_children():
+            widget.destroy()
+        platform = self.platform.get()
+        selected_day = self.day if self.date_filter.get() == "当前工作日" else ""
+        query = self.query.get().strip().casefold()
+        rows = []
+        for album in self.albums:
+            works = [work for work in album.works if work.platform in self.names
+                     and (platform == "所有平台" or self.names[work.platform] == platform)
+                     and (not selected_day or work.day == selected_day)
+                     and (query in album.title.casefold() or query in work.title.casefold())]
+            if works:
+                rows.append((album.title, works))
+        rows.sort(key=lambda row: any(work.day == self.day for work in row[1]), reverse=True)
+        self.count.configure(text=f"{len(rows)} 本专辑  ·  {sum(len(works) for _, works in rows)} 项作品")
+        if not rows:
+            border, body = panel(self.shelf, padding=20)
+            border.pack(fill="x")
+            ttk.Label(body, text="暂时无法读取本地作品。" if self.error else
+                      "没有符合筛选的作品。" if self.albums else "还没有保存的作品。",
+                      style="PanelTitle.TLabel").pack(anchor="w")
+            if not self.albums and not self.error:
+                ttk.Label(body, text="生成笔记、保存草稿或导出视频后，作品会按选题出现在这里。",
+                          style="PanelMuted.TLabel", wraplength=480).pack(anchor="w", pady=(5, 0))
+                if self.open_writing:
+                    ttk.Button(body, text="打开文案创作", command=self.open_writing).pack(anchor="w", pady=(9, 0))
+            return
+        for title, works in rows[:self.limit]:
+            self.album(title, works)
+        if len(rows) > self.limit:
+            ttk.Button(self.shelf, text=f"显示更多 · 还有 {len(rows)-self.limit} 本专辑",
+                       command=self.show_more).pack(pady=(0, 12))
+
+    def show_more(self):
+        self.limit += 10
+        self.redraw()
+
+    def album(self, title, works):
+        section = ttk.Frame(self.shelf, padding=(0, 0, 0, 15))
+        section.pack(fill="x")
+        tk.Frame(section, bg=LINE, height=1).pack(fill="x", pady=(0, 10))
+        group = {platform: [work for work in works if work.platform == platform] for platform in self.names}
+        group = {platform: versions for platform, versions in group.items() if versions}
+        tk.Label(section, bg=PAGE, fg=ACCENT, text=f"选题专辑  /  {len(group)} 个平台 · {len(works)} 项作品",
+                 font=(FONT, 8, "bold")).pack(anchor="w")
+        headline = ttk.Label(section, text=title, style="Headline.TLabel", justify="left")
+        headline.pack(anchor="w", fill="x", pady=(3, 8))
+        headline.bind("<Configure>", lambda e: headline.configure(wraplength=max(200, e.width-6)))
+        grid = ttk.Frame(section)
+        grid.pack(fill="x")
+        for column in range(3):
+            grid.columnconfigure(column, weight=1, uniform="works")
+        for column, (platform, versions) in enumerate(group.items()):
+            self.platform_card(grid, column, platform, versions)
+
+    def platform_card(self, grid, column, platform, versions):
+        box = ttk.Frame(grid, padding=(0, 0, 12 if column < 2 else 0, 2))
+        box.grid(row=0, column=column, sticky="nsew")
+        cover = AlbumCover(box, platform)
+        cover.pack(fill="x")
+        ttk.Label(box, text=self.names[platform], style="Headline.TLabel").pack(anchor="w", pady=(5, 0))
+        kinds = tuple(dict.fromkeys(work_format(work) for work in versions))
+        summary = ttk.Label(box, text=" · ".join(kinds), style="Muted.TLabel")
+        summary.pack(fill="x", pady=(1, 4))
+        select = None
+        if len(versions) > 1:
+            labels = [f"{work_format(work)} · {work.day[5:]} · {work.title}" for work in versions]
+            select = ttk.Combobox(box, state="readonly", values=labels, width=16)
+            select.pack(fill="x", pady=(0, 5))
+            select.current(next((i for i, work in enumerate(versions) if work.kind == "image"), 0))
+        title = ttk.Label(box, justify="left")
+        title.pack(fill="x")
+        meta = tk.Label(box, bg=PAGE, fg=ACCENT, font=(FONT, 8, "bold"), anchor="w", justify="left")
+        meta.pack(fill="x", pady=(3, 5))
+        actions = ttk.Frame(box)
+        actions.pack(fill="x")
+        action = ttk.Button(actions)
+        action.pack(side="left")
+        edit = ttk.Button(actions, text="继续创作", command=lambda: self.open_editor(platform))
+
+        def wrap(event):
+            for label in (summary, title, meta):
+                label.configure(wraplength=max(80, event.width-14))
+
+        box.bind("<Configure>", wrap)
+
+        def choose(_event=None):
+            work = versions[max(0, select.current())] if select else versions[0]
+            cover.update_work(work, len(versions))
+            title.configure(text=work.title)
+            details = [work.state]
+            edit.pack_forget()
+            if work.package:
+                details.extend([PLATFORM_PRESETS[platform]["aspect_ratio"], duration_label(work.package)])
+                action.configure(text="预览视频", command=lambda: self.read_work(
+                    work.package, work.title, self.names[platform], work.preview))
+                if work.editable:
+                    edit.pack(side="left", padx=(5, 0))
+            elif work.draft:
+                if work.pictures:
+                    details.append(f"{len(work.pictures)} 张")
+                action.configure(text="阅读图文" if work.pictures else "阅读文稿",
+                                 command=lambda: NotePreview(self, work, self.names[platform], self.start))
+            else:
+                action.configure(text="继续创作", command=lambda: self.open_editor(platform))
+            meta.configure(text="  ·  ".join(filter(None, (*details, work.day))))
+            if work.preview:
+                def ready(image, error):
+                    if not error and cover.winfo_exists() and cover.work is work:
+                        cover.update_work(work, len(versions), image)
+                self.start(lambda: load_thumbnail(work.preview, (300, 260)), ready)
+
+        if select:
+            select.bind("<<ComboboxSelected>>", choose)
+        choose()
+
+
+class NotePreview(tk.Toplevel):
+    """Read the actual note text and page through its locally saved pictures."""
+
+    def __init__(self, parent, work, platform, start):
+        super().__init__(parent)
+        self.work, self.start, self.page, self.art = work, start, 0, None
+        self.loading_image = False
+        self.title(f"{platform} · {work.title}")
+        self.transient(parent.winfo_toplevel())
+        self.configure(bg=PAGE)
+        self.geometry("850x590")
+        self.minsize(620, 410)
+        root = ttk.Frame(self, padding=18)
+        root.pack(fill="both", expand=True)
+        heading(root, work.title, f"{work_format(work)}  ·  {work.day}", kicker=f"{platform}  /  本地作品")
+        columns = ttk.Frame(root)
+        columns.pack(fill="both", expand=True)
+        if work.pictures:
+            art_panel = ttk.Frame(columns, width=332)
+            art_panel.pack(side="left", fill="both", padx=(0, 14))
+            art_panel.pack_propagate(False)
+            self.image = tk.Label(art_panel, bg=FIELD, fg=MUTED)
+            self.image.pack(fill="both", expand=True)
+            self.image.bind("<Configure>", self.paint)
+            self.credit = ttk.Label(art_panel, style="Muted.TLabel", wraplength=320)
+            self.credit.pack(anchor="w", pady=(5, 0))
+            pages = ttk.Frame(art_panel)
+            pages.pack(fill="x", pady=(5, 0))
+            self.back = ttk.Button(pages, text="‹ 上一张", command=lambda: self.show_page(self.page-1))
+            self.back.pack(side="left")
+            self.next = ttk.Button(pages, text="下一张 ›", command=lambda: self.show_page(self.page+1))
+            self.next.pack(side="right")
+            self.pager = ttk.Label(pages, style="Muted.TLabel")
+            self.pager.pack(expand=True)
+            self.bind("<Left>", lambda _: self.show_page(self.page-1))
+            self.bind("<Right>", lambda _: self.show_page(self.page+1))
+        text_panel = ttk.Frame(columns)
+        text_panel.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(text_panel)
+        scrollbar.pack(side="right", fill="y")
+        words = tk.Text(text_panel, wrap="word", font=(FONT, 11), fg=TEXT, bg=FIELD, relief="flat",
+                        highlightthickness=1, highlightbackground=LINE, padx=14, pady=12, spacing3=6,
+                        yscrollcommand=scrollbar.set)
+        words.pack(side="left", fill="both", expand=True)
+        scrollbar.configure(command=words.yview)
+        draft = work.draft
+        text = [draft.get("script", "")]
+        if draft.get("caption"):
+            text.extend(["发布配文", draft["caption"]])
+        for index, page in enumerate(draft.get("pages", ()), 1):
+            text.extend([f"{index:02d}  {page.get('title', '')}", page.get("text", "")])
+        words.insert("1.0", "\n\n".join(filter(None, text)))
+        words.configure(state="disabled")
+        bottom = ttk.Frame(root)
+        bottom.pack(fill="x", pady=(11, 0))
+        if work.directory:
+            ttk.Button(bottom, text="打开作品文件夹", command=lambda: os.startfile(work.directory)).pack(side="left")
+        if work.document:
+            ttk.Button(bottom, text="打开本批文档", command=lambda: os.startfile(work.document)).pack(side="left", padx=6)
+        close = ttk.Button(bottom, text="关闭", command=self.destroy)
+        close.pack(side="right")
+        self.bind("<Escape>", lambda _: self.destroy())
+        if work.pictures:
+            self.show_page(0)
+        close.focus_set()
+
+    def show_page(self, index):
+        if not 0 <= index < len(self.work.pictures):
+            return
+        self.page, self.art, self.loading_image = index, None, True
+        picture = self.work.pictures[index]
+        photo = picture.get("photo") or {}
+        self.credit.configure(text="  ·  ".join(filter(None, (photo.get("author"), photo.get("license")))))
+        self.pager.configure(text=f"{index+1} / {len(self.work.pictures)}")
+        self.back.configure(state="normal" if index else "disabled")
+        self.next.configure(state="normal" if index+1 < len(self.work.pictures) else "disabled")
+        self.image.configure(image="", text="正在读取图片…")
+
+        def ready(image, error):
+            if self.winfo_exists() and self.page == index:
+                self.art = image if not error else None
+                self.loading_image = False
+                self.paint()
+
+        self.start(lambda: load_thumbnail(picture["file"], (700, 900)), ready)
+
+    def paint(self, _event=None):
+        w, h = self.image.winfo_width(), self.image.winfo_height()
+        if self.loading_image:
+            return
+        if self.art is None:
+            self.image.configure(image="", text="无法读取本地图片。")
+        elif w > 12 and h > 12:
+            art = ImageOps.contain(self.art, (w-8, h-8))
+            self.picture = ImageTk.PhotoImage(art, master=self)
+            self.image.configure(image=self.picture, text="")
 
 
 class MatrixPage:
-    def __init__(self, parent, names, accounts):
+    def __init__(self, parent, names, accounts, save_douyin, open_douyin):
         bar = heading(parent, "矩阵账号", "查看平台连接状态、投稿账号和已授权作品。")
-        ttk.Button(bar, text="账号设置", style="Accent.TButton", command=accounts).pack(side="right")
+        ttk.Button(bar, text="开放平台设置", command=accounts).pack(side="right")
         grid = ttk.Frame(parent)
         grid.pack(fill="x")
         self.cards = {}
@@ -370,10 +741,53 @@ class MatrixPage:
             self.cards[key] = (status, account)
             ttk.Button(card, text="查看账号与作品 ↗", command=lambda platform=key: accounts(platform)).pack(anchor="w")
 
-    def update(self, rows):
+        border, body = panel(parent)
+        border.pack(fill="both", expand=True, pady=(16, 0))
+        header = ttk.Frame(body, style="Panel.TFrame")
+        header.pack(fill="x")
+        ttk.Label(header, text="抖音个人号", style="PanelTitle.TLabel").pack(side="left")
+        ttk.Button(header, text="添加抖音账号", style="Accent.TButton", command=save_douyin).pack(side="right")
+        ttk.Label(body, text="每个号首次扫码后会保留自己的登录。发稿时在发布中心选择账号。",
+                  style="PanelMuted.TLabel").pack(anchor="w", pady=(6, 12))
+        listing = ttk.Frame(body, style="Panel.TFrame")
+        listing.pack(fill="both", expand=True)
+        self.douyin = ttk.Treeview(listing, show="headings", columns=("account",), height=5, selectmode="browse")
+        self.douyin.heading("account", text="账号备注")
+        self.douyin.column("account", anchor="w")
+        scroll = ttk.Scrollbar(listing, command=self.douyin.yview)
+        self.douyin.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.douyin.pack(side="left", fill="both", expand=True)
+        controls = ttk.Frame(body, style="Panel.TFrame")
+        controls.pack(fill="x", pady=(10, 0))
+        self.sign_in = ttk.Button(controls, text="登录 / 查看账号",
+                                  command=lambda: open_douyin(self.douyin.selection()[0]))
+        self.sign_in.pack(side="left")
+        self.rename = ttk.Button(controls, text="修改备注",
+                                 command=lambda: save_douyin(self.douyin.selection()[0]))
+        self.rename.pack(side="left", padx=8)
+        self.douyin.bind("<<TreeviewSelect>>", self.update_douyin_actions)
+        self.update_douyin_actions()
+
+    def update_douyin_actions(self, _event=None):
+        state = "normal" if self.douyin.selection() else "disabled"
+        self.sign_in.configure(state=state)
+        self.rename.configure(state=state)
+
+    def update(self, rows, douyin_profiles):
         for key, (status, account) in self.cards.items():
             row = rows.get(key, {})
             connected = bool(row.get("identity"))
-            status.configure(text="已连接" if connected else "创作者后台" if key == "xiaohongshu" else "未连接")
+            status.configure(text="开放平台已授权" if connected else
+                             ("工作台内登录" if key == "douyin" else "创作者后台"))
             account.configure(text=row.get("account", "—") if connected else
-                              "平台后台管理" if key == "xiaohongshu" else "可配置开放平台应用")
+                              ("在下方管理个人号" if key == "douyin" else "在浏览器登录和管理作品"))
+        selected = self.douyin.selection()
+        self.douyin.delete(*self.douyin.get_children())
+        for profile_id, label in douyin_profiles.items():
+            self.douyin.insert("", "end", iid=profile_id, values=(label,))
+        if selected and selected[0] in douyin_profiles:
+            self.douyin.selection_set(selected[0])
+        elif len(douyin_profiles) == 1:
+            self.douyin.selection_set(next(iter(douyin_profiles)))
+        self.update_douyin_actions()

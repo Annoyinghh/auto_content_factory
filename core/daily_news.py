@@ -31,6 +31,10 @@ def web_url(value):
 
 
 def _feed_date(value):
+    localized = re.fullmatch(r"(?:周[一二三四五六日天],\s*)?(\d{1,2}) (\d{1,2})月 (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT", value)
+    if localized:
+        day, month, year, hour, minute, second = map(int, localized.groups())
+        return dt.datetime(year, month, day, hour, minute, second, tzinfo=dt.timezone.utc)
     try:
         stamp = dt.datetime.fromisoformat(value)
     except ValueError:
@@ -38,7 +42,7 @@ def _feed_date(value):
     return stamp.replace(tzinfo=stamp.tzinfo or dt.timezone.utc)
 
 
-def parse_feed(xml, now, *, search_results=False, allow_undated=False):
+def parse_feed(xml, now, *, search_results=False, allow_undated=False, allow_older=False):
     if isinstance(xml, bytes) and b"<!DOCTYPE" in xml.upper():
         raise ValueError("资讯源不应包含 XML 文档类型声明")
     root = ElementTree.fromstring(xml)
@@ -68,7 +72,8 @@ def parse_feed(xml, now, *, search_results=False, allow_undated=False):
             if not allow_undated or published:
                 continue
             stamp = None
-        if stamp and not now - dt.timedelta(hours=48) <= stamp <= now + dt.timedelta(minutes=10):
+        if stamp and (stamp > now + dt.timedelta(minutes=10)
+                      or not allow_older and stamp < now - dt.timedelta(hours=48)):
             continue
         parsed = urlsplit(link)
         query = urlencode([(key, value) for key, value in parse_qsl(parsed.query) if not key.startswith("utm_")])
@@ -76,6 +81,8 @@ def parse_feed(xml, now, *, search_results=False, allow_undated=False):
         records.append({
             "title": title[:120],
             "summary": summary[:750],
+            "content_origin": "feed",
+            "summary_truncated": len(summary) > 750,
             "url": link,
             "source": plain_text((entry.findtext("source") or entry.findtext("Source") or parsed.hostname)
                                  if search_results else channel.findtext("title", ""))[:35] or parsed.hostname,
@@ -107,6 +114,9 @@ def collect_news(now):
 
 
 def story_key(story):
+    if (story.get('source_platform') == 'xiaohongshu'
+            and re.fullmatch(r'[a-f0-9]{24}', str(story.get('source_note_id', '')))):
+        return hashlib.sha256(('xiaohongshu:' + story['source_note_id']).encode()).hexdigest()[:20]
     title = re.sub(r"[\W_]+", "", story["title"].casefold())
     return hashlib.sha256(title.encode()).hexdigest()[:20]
 
@@ -114,6 +124,8 @@ def story_key(story):
 def select_stories(stories, seen):
     unique = {}
     for story in sorted(stories, key=lambda entry: entry["published"], reverse=True):
+        if story.get("source_type") == "reference":
+            continue
         unique.setdefault(story_key(story), story)
 
     candidates = []
